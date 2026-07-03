@@ -1,0 +1,10 @@
+{
+  "name": "PaperTerm",
+  "application": "paperterm",
+  "qtfb": true,
+  "supportsVirtualKeyboard": true,
+  "disablesWindowedMode": false,
+  "environment": {
+    "RUST_BACKTRACE": "1"
+  }
+}

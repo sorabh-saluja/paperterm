@@ -1,0 +1,16 @@
+[package]
+name = "paperterm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Terminal emulator for the reMarkable Paper Pro with pixel-wise e-ink updates"
+
+[dependencies]
+alacritty_terminal = { version = "0.26.0", default-features = false }
+polling = "3"
+libc = "0.2"
+signal-hook = "0.3"
+
+[profile.release]
+strip = true
+lto = true
