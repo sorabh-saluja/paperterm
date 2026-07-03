@@ -208,8 +208,14 @@ impl Osk {
                     ModState::Locked => ModState::Off,
                 };
                 self.set_mod(m, next);
-                self.draw_key(fb, font, idx, true);
-                dirty.push(self.key_rect(idx));
+                if m == Mod::Shift {
+                    // Shift changes every key label: redraw the whole band.
+                    self.draw_all(fb, font);
+                    dirty.push((0, self.y0, SCREEN_W, self.height));
+                } else {
+                    self.draw_key(fb, font, idx, true);
+                    dirty.push(self.key_rect(idx));
+                }
             }
             KeyDef::FullRefresh => {
                 self.draw_key(fb, font, idx, true);
@@ -247,9 +253,14 @@ impl Osk {
 
     fn consume_oneshots(&mut self, fb: &mut [u8], font: &Psf2Font) -> Vec<(usize, usize, usize, usize)> {
         let mut dirty = vec![];
+        let mut shift_changed = false;
         for m in [Mod::Shift, Mod::Ctrl, Mod::Alt] {
             if self.mod_state(m) == ModState::Oneshot {
                 self.set_mod(m, ModState::Off);
+                if m == Mod::Shift {
+                    shift_changed = true;
+                    continue;
+                }
                 for (i, k) in self.keys.iter().enumerate() {
                     if let KeyDef::Modifier(km, _) = k.def {
                         if km == m {
@@ -260,6 +271,11 @@ impl Osk {
                     }
                 }
             }
+        }
+        if shift_changed {
+            // Labels revert to unshifted: redraw the whole band.
+            self.draw_all(fb, font);
+            dirty.push((0, self.y0, SCREEN_W, self.height));
         }
         dirty
     }
@@ -272,7 +288,8 @@ impl Osk {
     pub fn draw_all(&self, fb: &mut [u8], font: &Psf2Font) {
         render::fill_rect(fb, 0, self.y0, SCREEN_W, self.height, render::WHITE);
         for i in 0..self.keys.len() {
-            self.draw_key_i(fb, font, i, false);
+            let pressed = self.pressed.values().any(|&p| p == i);
+            self.draw_key_i(fb, font, i, pressed);
         }
     }
 
@@ -301,9 +318,11 @@ impl Osk {
         if latched == ModState::Oneshot {
             render::fill_rect(fb, k.x + bw, k.y + bw, k.w - 2 * bw, 8, fg);
         }
-        // Label.
+        // Label: char keys show their shifted glyph while shift is engaged.
         let label: String = match k.def {
-            KeyDef::Char(c, _) => c.to_string(),
+            KeyDef::Char(c, shifted) => {
+                if self.shift != ModState::Off { shifted.to_string() } else { c.to_string() }
+            }
             KeyDef::Named(_, l) | KeyDef::Modifier(_, l) => l.to_string(),
             KeyDef::FullRefresh => "rfsh".to_string(),
         };
