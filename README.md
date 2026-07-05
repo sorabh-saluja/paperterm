@@ -37,3 +37,18 @@ flashes the screen.
 
 Cross-compiled from x86_64 to `aarch64-unknown-linux-gnu` (device: glibc 2.39).
 See `docs/` and `.cargo/config.toml` once toolchain research lands.
+
+---
+
+## The remagic family
+
+Part of **[remagic](https://github.com/YOUR-USER/remagic)** — tools to make your
+reMarkable Paper Pro magical:
+
+- **[remagic](https://github.com/YOUR-USER/remagic)** — one-command installer:
+  developer mode → AppLoad → your apps.
+- **[riddle](https://github.com/YOUR-USER/riddle)** — an enchanted diary that
+  writes back.
+- **paperterm** — this terminal emulator.
+- **[quill](https://github.com/YOUR-USER/quill)** — the takeover display host for
+  instant-ink apps.
