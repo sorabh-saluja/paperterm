@@ -28,15 +28,30 @@ Input (touch / on-screen keyboard / physical keyboards) arrives over the same
 qtfb channel; the OSK is drawn by us and partial-updated so typing never
 flashes the screen.
 
-## Device layout
+## Install
 
-- Binary + manifest install to `/home/root/xovi/exthome/appload/paperterm/`
-- Requires xovi + AppLoad (the qtfb server lives in appload.so)
+PaperTerm requires a reMarkable Paper Pro with
+[remagic](https://github.com/maximerivest/remagic) installed. Open the remagic
+Store on the tablet and tap **PaperTerm**, or install it from a computer:
+
+```sh
+remagic install paperterm
+```
+
+The app is installed at `/home/root/xovi/exthome/appload/paperterm/`. Open it
+from AppLoad. Run `exit` or use AppLoad's top-center close gesture to leave.
 
 ## Building
 
-Cross-compiled from x86_64 to `aarch64-unknown-linux-gnu` (device: glibc 2.39).
-See `docs/` and `.cargo/config.toml` once toolchain research lands.
+Install an aarch64 GNU cross-toolchain, then build and stage the AppLoad bundle:
+
+```sh
+cargo build --release --target aarch64-unknown-linux-gnu
+./make-bundle.sh
+```
+
+The device uses glibc 2.39. The staged app is written to `dist/paperterm/` and
+can be installed locally with `remagic install ./dist/paperterm`.
 
 ---
 
