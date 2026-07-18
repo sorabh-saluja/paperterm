@@ -1,6 +1,7 @@
 //! paperterm — terminal emulator for the reMarkable Paper Pro.
 //! alacritty_terminal core + native qtfb client + PSF2 renderer + on-screen keyboard.
 
+mod evdev_keyboard;
 mod font;
 mod keys;
 mod osk;
@@ -15,9 +16,9 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use alacritty_terminal::event::{Event, EventListener, WindowSize};
+use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::{Config, LineDamageBounds, Term, TermDamage};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
@@ -134,9 +135,19 @@ fn run() -> std::io::Result<()> {
     };
     let font = font::Psf2Font::parse(font_data).map_err(std::io::Error::other)?;
 
-    // Geometry: terminal on top, OSK band at the bottom.
-    let term_h = SCREEN_H - OSK_H;
-    let area = TermArea {
+    let mut hwkbd = evdev_keyboard::EvdevKeyboard::open().unwrap_or_else(|e| {
+        eprintln!("paperterm: hardware keyboard scan failed: {e}");
+        evdev_keyboard::EvdevKeyboard::empty()
+    });
+    let mut osk_visible = hwkbd.is_empty();
+
+    // Geometry: terminal on top, with the OSK band only when no hardware keyboard is present.
+    let mut term_h = if osk_visible {
+        SCREEN_H - OSK_H
+    } else {
+        SCREEN_H
+    };
+    let mut area = TermArea {
         cols: SCREEN_W / font.width,
         rows: term_h / font.height,
         cw: font.width,
@@ -150,16 +161,23 @@ fn run() -> std::io::Result<()> {
     );
 
     // ---- qtfb ----
-    let mut client = qtfb::QtfbClient::connect(key, qtfb::FBFMT_RMPP_RGB565, SCREEN_W, SCREEN_H, 2)?;
+    let mut client =
+        qtfb::QtfbClient::connect(key, qtfb::FBFMT_RMPP_RGB565, SCREEN_W, SCREEN_H, 2)?;
     // Low-latency waveform for typing. NOTE: server stalls this connection 1s.
     let _ = client.set_refresh_mode(qtfb::REFRESH_MODE_FAST);
 
     // ---- terminal + pty ----
     tty::setup_env();
-    let size = GridSize { cols: area.cols, lines: area.rows };
+    let size = GridSize {
+        cols: area.cols,
+        lines: area.rows,
+    };
     let (event_tx, event_rx) = mpsc::channel();
     let mut term: Term<Listener> = Term::new(
-        Config { scrolling_history: 5000, ..Config::default() },
+        Config {
+            scrolling_history: 5000,
+            ..Config::default()
+        },
         &size,
         Listener(event_tx),
     );
@@ -187,12 +205,24 @@ fn run() -> std::io::Result<()> {
     };
     let mut pty = tty::new(&pty_options, window_size, 0)?;
 
-    // ---- polling: key 0 = pty, key 1 = SIGCHLD pipe, key 2 = qtfb socket ----
+    // ---- polling: key 0 = pty, key 1 = SIGCHLD pipe, key 2 = qtfb socket, 20+ = evdev keyboards ----
     let poller = Arc::new(Poller::new()?);
     unsafe {
         pty.register(&poller, PollEvent::readable(0), PollMode::Level)?;
-        poller.add_with_mode(&FdSource(client.raw_fd()), PollEvent::readable(2), PollMode::Level)?;
+        poller.add_with_mode(
+            &FdSource(client.raw_fd()),
+            PollEvent::readable(2),
+            PollMode::Level,
+        )?;
+        for (poll_key, fd) in hwkbd.fds() {
+            poller.add_with_mode(
+                &FdSource(fd),
+                PollEvent::readable(poll_key),
+                PollMode::Level,
+            )?;
+        }
     }
+    eprintln!("paperterm: hardware keyboard devices: {}", hwkbd.len());
 
     let sigterm = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
@@ -202,10 +232,19 @@ fn run() -> std::io::Result<()> {
     let mut kbd = osk::Osk::new(term_h, OSK_H);
 
     // Initial paint: white screen, keyboard, full update.
-    render::fill_rect(client.framebuffer(), 0, 0, SCREEN_W, SCREEN_H, render::WHITE);
+    render::fill_rect(
+        client.framebuffer(),
+        0,
+        0,
+        SCREEN_W,
+        SCREEN_H,
+        render::WHITE,
+    );
     {
         let fb = client.framebuffer();
-        kbd.draw_all(fb, &font);
+        if osk_visible {
+            kbd.draw_all(fb, &font);
+        }
     }
     client.update_all()?;
 
@@ -215,6 +254,7 @@ fn run() -> std::io::Result<()> {
     let mut dirty = DirtyRegion::default();
     // Touch-drag scrolling state on the terminal area.
     let mut drag: Option<(i32, i32)> = None; // (dev_id, last_y)
+    let mut next_hwkbd_scan = Instant::now() + Duration::from_secs(2);
 
     'main: loop {
         if sigterm.load(Ordering::Relaxed) {
@@ -223,6 +263,81 @@ fn run() -> std::io::Result<()> {
 
         events.clear();
         poller.wait(&mut events, Some(Duration::from_millis(300)))?;
+        if Instant::now() >= next_hwkbd_scan {
+            next_hwkbd_scan = Instant::now() + Duration::from_secs(2);
+            let had_hwkbd = !hwkbd.is_empty();
+            match hwkbd.rescan() {
+                Ok(new_fds) => {
+                    if !new_fds.is_empty() {
+                        unsafe {
+                            for (poll_key, fd) in new_fds {
+                                poller.add_with_mode(
+                                    &FdSource(fd),
+                                    PollEvent::readable(poll_key),
+                                    PollMode::Level,
+                                )?;
+                            }
+                        }
+                    }
+
+                    let has_hwkbd = !hwkbd.is_empty();
+                    if has_hwkbd != had_hwkbd {
+                        eprintln!("paperterm: hardware keyboard devices: {}", hwkbd.len());
+                    }
+                    if has_hwkbd && osk_visible {
+                        osk_visible = false;
+                        kbd.y0 = SCREEN_H;
+                        term_h = SCREEN_H;
+                        area.rows = term_h / font.height;
+                        let new_size = GridSize {
+                            cols: area.cols,
+                            lines: area.rows,
+                        };
+                        term.resize(new_size);
+                        pty.on_resize(WindowSize {
+                            num_cols: area.cols as u16,
+                            num_lines: area.rows as u16,
+                            cell_width: font.width as u16,
+                            cell_height: font.height as u16,
+                        });
+                        term.scroll_display(Scroll::Bottom);
+                        render::fill_rect(
+                            client.framebuffer(),
+                            0,
+                            0,
+                            SCREEN_W,
+                            SCREEN_H,
+                            render::WHITE,
+                        );
+                        dirty.add(0, 0, SCREEN_W, SCREEN_H);
+                        activity = true;
+                    } else if !has_hwkbd && !osk_visible {
+                        osk_visible = true;
+                        term_h = SCREEN_H - OSK_H;
+                        area.rows = term_h / font.height;
+                        let new_size = GridSize {
+                            cols: area.cols,
+                            lines: area.rows,
+                        };
+                        term.resize(new_size);
+                        pty.on_resize(WindowSize {
+                            num_cols: area.cols as u16,
+                            num_lines: area.rows as u16,
+                            cell_width: font.width as u16,
+                            cell_height: font.height as u16,
+                        });
+                        kbd = osk::Osk::new(term_h, OSK_H);
+                        term.scroll_display(Scroll::Bottom);
+                        let fb = client.framebuffer();
+                        render::fill_rect(fb, 0, 0, SCREEN_W, SCREEN_H, render::WHITE);
+                        kbd.draw_all(fb, &font);
+                        dirty.add(0, 0, SCREEN_W, SCREEN_H);
+                        activity = true;
+                    }
+                }
+                Err(e) => eprintln!("paperterm: hardware keyboard rescan failed: {e}"),
+            }
+        }
 
         for ev in events.iter() {
             match ev.key {
@@ -250,9 +365,32 @@ fn run() -> std::io::Result<()> {
                     };
                     for iev in input {
                         handle_input(
-                            iev, &mut kbd, &mut client, &mut term, &mut pty, &font, &area,
-                            &mut dirty, &mut drag, &mut activity,
+                            iev,
+                            &mut kbd,
+                            &mut client,
+                            &mut term,
+                            &mut pty,
+                            &font,
+                            &area,
+                            &mut dirty,
+                            &mut drag,
+                            &mut activity,
                         )?;
+                    }
+                }
+                key if key >= evdev_keyboard::POLL_KEY_BASE && ev.readable => {
+                    match hwkbd.drain_poll_key(key) {
+                        Ok(key_events) => {
+                            for (action, ctrl, alt) in key_events {
+                                let bytes = keys::encode(action, ctrl, alt, *term.mode());
+                                write_pty(&mut pty, &bytes)?;
+                                if term.grid().display_offset() != 0 {
+                                    term.scroll_display(Scroll::Bottom);
+                                    activity = true;
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("paperterm: hardware keyboard read failed: {e}"),
                     }
                 }
                 _ => {}
