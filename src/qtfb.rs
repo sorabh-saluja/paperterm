@@ -34,6 +34,8 @@ pub const INPUT_PEN_PRESS: i32 = 0x20;
 pub const INPUT_PEN_RELEASE: i32 = 0x21;
 #[allow(dead_code)]
 pub const INPUT_PEN_UPDATE: i32 = 0x22;
+pub const INPUT_BTN_PRESS: i32 = 0x30;
+pub const INPUT_BTN_RELEASE: i32 = 0x31;
 pub const INPUT_VKB_PRESS: i32 = 0x40;
 #[allow(dead_code)]
 pub const INPUT_VKB_RELEASE: i32 = 0x41;

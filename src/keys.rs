@@ -121,3 +121,172 @@ pub fn decode_vkb(x: i32) -> Option<(KeyAction, bool, bool)> {
     };
     Some((action, ctrl, alt))
 }
+
+// Qt::Key values for the non-printing keys AppLoad forwards from a physical keyboard.
+const QT_KEY_ESCAPE: i32 = 0x0100_0000;
+const QT_KEY_TAB: i32 = 0x0100_0001;
+const QT_KEY_BACKTAB: i32 = 0x0100_0002;
+const QT_KEY_BACKSPACE: i32 = 0x0100_0003;
+const QT_KEY_RETURN: i32 = 0x0100_0004;
+const QT_KEY_ENTER: i32 = 0x0100_0005;
+const QT_KEY_DELETE: i32 = 0x0100_0007;
+const QT_KEY_HOME: i32 = 0x0100_0010;
+const QT_KEY_END: i32 = 0x0100_0011;
+const QT_KEY_LEFT: i32 = 0x0100_0012;
+const QT_KEY_UP: i32 = 0x0100_0013;
+const QT_KEY_RIGHT: i32 = 0x0100_0014;
+const QT_KEY_DOWN: i32 = 0x0100_0015;
+const QT_KEY_PAGE_UP: i32 = 0x0100_0016;
+const QT_KEY_PAGE_DOWN: i32 = 0x0100_0017;
+const QT_KEY_SHIFT: i32 = 0x0100_0020;
+const QT_KEY_CONTROL: i32 = 0x0100_0021;
+const QT_KEY_META: i32 = 0x0100_0022;
+const QT_KEY_ALT: i32 = 0x0100_0023;
+const QT_KEY_CAPS_LOCK: i32 = 0x0100_0024;
+
+/// Modifier state for physical keyboards. AppLoad sends only the bare Qt::Key
+/// for each press and release, so modifiers have to be tracked here.
+#[derive(Debug, Default)]
+pub struct PhysicalKeyboard {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    caps: bool,
+}
+
+impl PhysicalKeyboard {
+    pub fn press(&mut self, key: i32) -> Option<(KeyAction, bool, bool)> {
+        let action = match key {
+            QT_KEY_SHIFT => {
+                self.shift = true;
+                return None;
+            }
+            // Qt reports the Type Folio's Ctrl key as Meta.
+            QT_KEY_CONTROL | QT_KEY_META => {
+                self.ctrl = true;
+                return None;
+            }
+            QT_KEY_ALT => {
+                self.alt = true;
+                return None;
+            }
+            QT_KEY_CAPS_LOCK => {
+                self.caps = !self.caps;
+                return None;
+            }
+            QT_KEY_ESCAPE => KeyAction::Esc,
+            QT_KEY_TAB | QT_KEY_BACKTAB => KeyAction::Tab,
+            QT_KEY_BACKSPACE => KeyAction::Backspace,
+            QT_KEY_RETURN | QT_KEY_ENTER => KeyAction::Enter,
+            QT_KEY_DELETE => KeyAction::Delete,
+            QT_KEY_HOME => KeyAction::Home,
+            QT_KEY_END => KeyAction::End,
+            QT_KEY_LEFT => KeyAction::Left,
+            QT_KEY_UP => KeyAction::Up,
+            QT_KEY_RIGHT => KeyAction::Right,
+            QT_KEY_DOWN => KeyAction::Down,
+            QT_KEY_PAGE_UP => KeyAction::PgUp,
+            QT_KEY_PAGE_DOWN => KeyAction::PgDn,
+            // Qt reports letters in uppercase whatever the shift state, and
+            // symbols already shifted ('!' rather than '1').
+            0x20..=0x10_FFFF => {
+                let c = char::from_u32(key as u32)?;
+                if self.shift != self.caps {
+                    KeyAction::Char(c.to_uppercase().next().unwrap_or(c))
+                } else {
+                    KeyAction::Char(c.to_lowercase().next().unwrap_or(c))
+                }
+            }
+            _ => return None,
+        };
+        Some((action, self.ctrl, self.alt))
+    }
+
+    pub fn release(&mut self, key: i32) {
+        match key {
+            QT_KEY_SHIFT => self.shift = false,
+            QT_KEY_CONTROL | QT_KEY_META => self.ctrl = false,
+            QT_KEY_ALT => self.alt = false,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ch(c: char, ctrl: bool, alt: bool) -> Option<(KeyAction, bool, bool)> {
+        Some((KeyAction::Char(c), ctrl, alt))
+    }
+
+    #[test]
+    fn letters_follow_shift_and_caps_lock() {
+        let mut k = PhysicalKeyboard::default();
+        assert_eq!(k.press(0x41), ch('a', false, false));
+        k.press(QT_KEY_SHIFT);
+        assert_eq!(k.press(0x41), ch('A', false, false));
+        k.release(QT_KEY_SHIFT);
+        assert_eq!(k.press(0x41), ch('a', false, false));
+        k.press(QT_KEY_CAPS_LOCK);
+        k.release(QT_KEY_CAPS_LOCK);
+        assert_eq!(k.press(0x41), ch('A', false, false));
+        k.press(QT_KEY_SHIFT);
+        assert_eq!(k.press(0x41), ch('a', false, false));
+    }
+
+    #[test]
+    fn symbols_and_digits_pass_through() {
+        let mut k = PhysicalKeyboard::default();
+        assert_eq!(k.press(0x31), ch('1', false, false));
+        k.press(QT_KEY_SHIFT);
+        assert_eq!(k.press(0x21), ch('!', false, false));
+        assert_eq!(k.press(0x20), ch(' ', false, false));
+    }
+
+    #[test]
+    fn ctrl_c_and_alt_reach_the_pty() {
+        let mut k = PhysicalKeyboard::default();
+        k.press(QT_KEY_CONTROL);
+        let (a, c, al) = k.press(0x43).unwrap();
+        assert_eq!(encode(a, c, al, TermMode::empty()), vec![0x03]);
+        k.release(QT_KEY_CONTROL);
+        k.press(QT_KEY_ALT);
+        let (a, c, al) = k.press(0x58).unwrap();
+        assert_eq!(encode(a, c, al, TermMode::empty()), vec![0x1b, b'x']);
+    }
+
+    #[test]
+    fn folio_ctrl_arrives_as_meta() {
+        let mut k = PhysicalKeyboard::default();
+        k.press(QT_KEY_META);
+        let (a, c, al) = k.press(0x43).unwrap();
+        assert_eq!(encode(a, c, al, TermMode::empty()), vec![0x03]);
+        k.release(QT_KEY_META);
+        assert_eq!(k.press(0x43), ch('c', false, false));
+    }
+
+    #[test]
+    fn named_keys_encode_for_the_terminal() {
+        let mut k = PhysicalKeyboard::default();
+        for (key, bytes) in [
+            (QT_KEY_RETURN, &b"\r"[..]),
+            (QT_KEY_ENTER, b"\r"),
+            (QT_KEY_BACKSPACE, b"\x7f"),
+            (QT_KEY_TAB, b"\t"),
+            (QT_KEY_ESCAPE, b"\x1b"),
+            (QT_KEY_UP, b"\x1b[A"),
+            (QT_KEY_DELETE, b"\x1b[3~"),
+        ] {
+            let (a, c, al) = k.press(key).unwrap();
+            assert_eq!(encode(a, c, al, TermMode::empty()), bytes);
+        }
+    }
+
+    #[test]
+    fn unknown_special_keys_are_ignored() {
+        let mut k = PhysicalKeyboard::default();
+        assert_eq!(k.press(0x0100_0030), None); // F1
+        assert_eq!(k.press(QT_KEY_SHIFT), None);
+    }
+}

@@ -1,8 +1,8 @@
 //! paperterm — terminal emulator for the reMarkable Paper Pro.
 //! alacritty_terminal core + native qtfb client + PSF2 renderer + on-screen keyboard.
 
-mod evdev_keyboard;
 mod font;
+mod hw_keyboard;
 mod keys;
 mod osk;
 mod palette;
@@ -135,11 +135,7 @@ fn run() -> std::io::Result<()> {
     };
     let font = font::Psf2Font::parse(font_data).map_err(std::io::Error::other)?;
 
-    let mut hwkbd = evdev_keyboard::EvdevKeyboard::open().unwrap_or_else(|e| {
-        eprintln!("paperterm: hardware keyboard scan failed: {e}");
-        evdev_keyboard::EvdevKeyboard::empty()
-    });
-    let mut osk_visible = hwkbd.is_empty();
+    let mut osk_visible = !hw_keyboard::present();
 
     // Geometry: terminal on top, with the OSK band only when no hardware keyboard is present.
     let mut term_h = if osk_visible {
@@ -214,15 +210,7 @@ fn run() -> std::io::Result<()> {
             PollEvent::readable(2),
             PollMode::Level,
         )?;
-        for (poll_key, fd) in hwkbd.fds() {
-            poller.add_with_mode(
-                &FdSource(fd),
-                PollEvent::readable(poll_key),
-                PollMode::Level,
-            )?;
-        }
     }
-    eprintln!("paperterm: hardware keyboard devices: {}", hwkbd.len());
 
     let sigterm = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
@@ -230,6 +218,7 @@ fn run() -> std::io::Result<()> {
 
     let palette = palette::Palette::new();
     let mut kbd = osk::Osk::new(term_h, OSK_H);
+    let mut physical = keys::PhysicalKeyboard::default();
 
     // Initial paint: white screen, keyboard, full update.
     render::fill_rect(
@@ -265,77 +254,56 @@ fn run() -> std::io::Result<()> {
         poller.wait(&mut events, Some(Duration::from_millis(300)))?;
         if Instant::now() >= next_hwkbd_scan {
             next_hwkbd_scan = Instant::now() + Duration::from_secs(2);
-            let had_hwkbd = !hwkbd.is_empty();
-            match hwkbd.rescan() {
-                Ok(new_fds) => {
-                    if !new_fds.is_empty() {
-                        unsafe {
-                            for (poll_key, fd) in new_fds {
-                                poller.add_with_mode(
-                                    &FdSource(fd),
-                                    PollEvent::readable(poll_key),
-                                    PollMode::Level,
-                                )?;
-                            }
-                        }
-                    }
-
-                    let has_hwkbd = !hwkbd.is_empty();
-                    if has_hwkbd != had_hwkbd {
-                        eprintln!("paperterm: hardware keyboard devices: {}", hwkbd.len());
-                    }
-                    if has_hwkbd && osk_visible {
-                        osk_visible = false;
-                        kbd.y0 = SCREEN_H;
-                        term_h = SCREEN_H;
-                        area.rows = term_h / font.height;
-                        let new_size = GridSize {
-                            cols: area.cols,
-                            lines: area.rows,
-                        };
-                        term.resize(new_size);
-                        pty.on_resize(WindowSize {
-                            num_cols: area.cols as u16,
-                            num_lines: area.rows as u16,
-                            cell_width: font.width as u16,
-                            cell_height: font.height as u16,
-                        });
-                        term.scroll_display(Scroll::Bottom);
-                        render::fill_rect(
-                            client.framebuffer(),
-                            0,
-                            0,
-                            SCREEN_W,
-                            SCREEN_H,
-                            render::WHITE,
-                        );
-                        dirty.add(0, 0, SCREEN_W, SCREEN_H);
-                        activity = true;
-                    } else if !has_hwkbd && !osk_visible {
-                        osk_visible = true;
-                        term_h = SCREEN_H - OSK_H;
-                        area.rows = term_h / font.height;
-                        let new_size = GridSize {
-                            cols: area.cols,
-                            lines: area.rows,
-                        };
-                        term.resize(new_size);
-                        pty.on_resize(WindowSize {
-                            num_cols: area.cols as u16,
-                            num_lines: area.rows as u16,
-                            cell_width: font.width as u16,
-                            cell_height: font.height as u16,
-                        });
-                        kbd = osk::Osk::new(term_h, OSK_H);
-                        term.scroll_display(Scroll::Bottom);
-                        let fb = client.framebuffer();
-                        render::fill_rect(fb, 0, 0, SCREEN_W, SCREEN_H, render::WHITE);
-                        kbd.draw_all(fb, &font);
-                        dirty.add(0, 0, SCREEN_W, SCREEN_H);
-                        activity = true;
-                    }
-                }
-                Err(e) => eprintln!("paperterm: hardware keyboard rescan failed: {e}"),
+            let has_hwkbd = hw_keyboard::present();
+            if has_hwkbd && osk_visible {
+                osk_visible = false;
+                kbd.y0 = SCREEN_H;
+                term_h = SCREEN_H;
+                area.rows = term_h / font.height;
+                let new_size = GridSize {
+                    cols: area.cols,
+                    lines: area.rows,
+                };
+                term.resize(new_size);
+                pty.on_resize(WindowSize {
+                    num_cols: area.cols as u16,
+                    num_lines: area.rows as u16,
+                    cell_width: font.width as u16,
+                    cell_height: font.height as u16,
+                });
+                term.scroll_display(Scroll::Bottom);
+                render::fill_rect(
+                    client.framebuffer(),
+                    0,
+                    0,
+                    SCREEN_W,
+                    SCREEN_H,
+                    render::WHITE,
+                );
+                dirty.add(0, 0, SCREEN_W, SCREEN_H);
+                activity = true;
+            } else if !has_hwkbd && !osk_visible {
+                osk_visible = true;
+                term_h = SCREEN_H - OSK_H;
+                area.rows = term_h / font.height;
+                let new_size = GridSize {
+                    cols: area.cols,
+                    lines: area.rows,
+                };
+                term.resize(new_size);
+                pty.on_resize(WindowSize {
+                    num_cols: area.cols as u16,
+                    num_lines: area.rows as u16,
+                    cell_width: font.width as u16,
+                    cell_height: font.height as u16,
+                });
+                kbd = osk::Osk::new(term_h, OSK_H);
+                term.scroll_display(Scroll::Bottom);
+                let fb = client.framebuffer();
+                render::fill_rect(fb, 0, 0, SCREEN_W, SCREEN_H, render::WHITE);
+                kbd.draw_all(fb, &font);
+                dirty.add(0, 0, SCREEN_W, SCREEN_H);
+                activity = true;
             }
         }
 
@@ -367,6 +335,7 @@ fn run() -> std::io::Result<()> {
                         handle_input(
                             iev,
                             &mut kbd,
+                            &mut physical,
                             &mut client,
                             &mut term,
                             &mut pty,
@@ -376,21 +345,6 @@ fn run() -> std::io::Result<()> {
                             &mut drag,
                             &mut activity,
                         )?;
-                    }
-                }
-                key if key >= evdev_keyboard::POLL_KEY_BASE && ev.readable => {
-                    match hwkbd.drain_poll_key(key) {
-                        Ok(key_events) => {
-                            for (action, ctrl, alt) in key_events {
-                                let bytes = keys::encode(action, ctrl, alt, *term.mode());
-                                write_pty(&mut pty, &bytes)?;
-                                if term.grid().display_offset() != 0 {
-                                    term.scroll_display(Scroll::Bottom);
-                                    activity = true;
-                                }
-                            }
-                        }
-                        Err(e) => eprintln!("paperterm: hardware keyboard read failed: {e}"),
                     }
                 }
                 _ => {}
@@ -450,6 +404,7 @@ fn run() -> std::io::Result<()> {
 fn handle_input(
     ev: qtfb::InputEvent,
     kbd: &mut osk::Osk,
+    physical: &mut keys::PhysicalKeyboard,
     client: &mut qtfb::QtfbClient,
     term: &mut Term<Listener>,
     pty: &mut tty::Pty,
@@ -471,6 +426,18 @@ fn handle_input(
                 }
             }
         }
+        // Physical keyboards arrive as bare Qt::Key values, focused window only.
+        qtfb::INPUT_BTN_PRESS => {
+            if let Some((action, ctrl, alt)) = physical.press(ev.x) {
+                let bytes = keys::encode(action, ctrl, alt, *term.mode());
+                write_pty(pty, &bytes)?;
+                if term.grid().display_offset() != 0 {
+                    term.scroll_display(Scroll::Bottom);
+                    *activity = true;
+                }
+            }
+        }
+        qtfb::INPUT_BTN_RELEASE => physical.release(ev.x),
         qtfb::INPUT_TOUCH_PRESS | qtfb::INPUT_PEN_PRESS => {
             if ev.y as usize >= kbd.y0 {
                 let osk_events = {
