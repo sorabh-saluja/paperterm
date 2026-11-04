@@ -16,15 +16,23 @@ const BUTTON_H: usize = 100;
 
 const MENU_W: usize = 500;
 const MENU_ROW_H: usize = 112;
-const MENU_ITEMS: [(&str, MenuItem); 4] = [
+const MENU_ITEMS: [(&str, MenuItem); 6] = [
+    ("Paste", MenuItem::Paste),
     ("Settings", MenuItem::Settings),
     ("Refresh screen", MenuItem::Refresh),
+    ("Minimize", MenuItem::Minimize),
     ("Exit PaperTerm", MenuItem::Exit),
     ("End session", MenuItem::EndSession),
 ];
 
 fn pill(w: usize) -> Rect {
     (w - 196, 12, 180, 76)
+}
+
+/// Beside the menu button while text is selected.
+pub fn copy_button(w: usize) -> Rect {
+    let p = pill(w);
+    (p.0 - 16 - p.2, p.1, p.2, p.3)
 }
 
 fn menu(w: usize) -> Rect {
@@ -44,8 +52,10 @@ const PREVIEW_LINES: [&str; 7] = [
 
 #[derive(Clone, Copy)]
 enum MenuItem {
+    Paste,
     Settings,
     Refresh,
+    Minimize,
     Exit,
     EndSession,
 }
@@ -78,6 +88,9 @@ pub enum UiCommand {
     RefreshScreen,
     CleanNow,
     Apply(Settings),
+    Copy,
+    Paste,
+    Minimize,
     Exit,
     /// Close the shell too, instead of leaving it running for next time.
     EndSession,
@@ -96,6 +109,8 @@ enum Screen {
 
 pub struct Ui {
     screen: Screen,
+    /// Text is selected, so the Copy button shows.
+    pub can_copy: bool,
     label: Font,
     title: Font,
     /// One per entry in FONTS, so each button shows its name in its own face.
@@ -223,6 +238,7 @@ impl Ui {
     pub fn new() -> Self {
         Self {
             screen: Screen::Terminal,
+            can_copy: false,
             label: Font::load(0, 40, false).expect("bundled fonts parse"),
             title: Font::load(0, DEFAULT_SIZE + 16, false).expect("bundled fonts parse"),
             samples: (0..FONTS.len())
@@ -258,6 +274,8 @@ impl Ui {
                 if contains(pill(w), x, y) {
                     self.screen = Screen::Menu;
                     UiCommand::MenuOpened
+                } else if self.can_copy && contains(copy_button(w), x, y) {
+                    UiCommand::Copy
                 } else {
                     UiCommand::Pass
                 }
@@ -269,11 +287,13 @@ impl Ui {
                     contains(rect, x, y).then_some(*item)
                 });
                 match item {
+                    Some(MenuItem::Paste) => UiCommand::Paste,
                     Some(MenuItem::Settings) => {
                         self.screen = Screen::Settings(Box::new(Panel::new(settings)));
                         UiCommand::PanelChanged
                     }
                     Some(MenuItem::Refresh) => UiCommand::RefreshScreen,
+                    Some(MenuItem::Minimize) => UiCommand::Minimize,
                     Some(MenuItem::Exit) => UiCommand::Exit,
                     Some(MenuItem::EndSession) => UiCommand::EndSession,
                     None => UiCommand::Closed,
@@ -323,6 +343,10 @@ impl Ui {
                 let m = menu(w);
                 (m.0, p.1, m.2, m.1 + m.3 - p.1)
             }
+            _ if self.can_copy => {
+                let c = copy_button(w);
+                (c.0, p.1, p.0 + p.2 - c.0, p.3)
+            }
             _ => p,
         }
     }
@@ -334,6 +358,9 @@ impl Ui {
     pub fn draw_overlay(&self, fb: &mut Canvas) {
         let open = matches!(self.screen, Screen::Menu);
         draw_button(fb, &self.label, pill(fb.w), "Menu", open);
+        if self.can_copy {
+            draw_button(fb, &self.label, copy_button(fb.w), "Copy", false);
+        }
         if open {
             let m = menu(fb.w);
             for (i, (label, _)) in MENU_ITEMS.iter().enumerate() {
@@ -442,7 +469,7 @@ mod tests {
             assert!(matches!(ui.on_press(p.0 as i32 + 1, p.1 as i32 + 1, &settings, screen), UiCommand::MenuOpened));
             let m = menu(w);
             assert!(matches!(
-                ui.on_press(m.0 as i32 + 1, m.1 as i32 + 1, &settings, screen),
+                ui.on_press(m.0 as i32 + 1, (m.1 + MENU_ROW_H) as i32 + 1, &settings, screen),
                 UiCommand::PanelChanged
             ));
             assert!(ui.settings_open());
@@ -453,6 +480,53 @@ mod tests {
             ));
             assert!(!ui.settings_open());
         }
+    }
+
+    #[test]
+    fn the_copy_button_only_answers_while_text_is_selected() {
+        for screen in SCREENS {
+            let settings = Settings::default();
+            let c = copy_button(screen.0);
+            let (x, y) = (c.0 as i32 + 1, c.1 as i32 + 1);
+            let mut ui = Ui::new();
+            assert!(matches!(ui.on_press(x, y, &settings, screen), UiCommand::Pass));
+            ui.can_copy = true;
+            assert!(matches!(ui.on_press(x, y, &settings, screen), UiCommand::Copy));
+            assert!(intersects(ui.overlay_rect(screen.0), c));
+            assert!(!intersects(c, pill(screen.0)));
+        }
+    }
+
+    #[test]
+    fn paste_is_the_first_menu_row_and_closes_the_menu() {
+        let screen = (PANEL_H, PANEL_W);
+        let settings = Settings::default();
+        let mut ui = Ui::new();
+        let p = pill(screen.0);
+        ui.on_press(p.0 as i32 + 1, p.1 as i32 + 1, &settings, screen);
+        let m = menu(screen.0);
+        assert!(m.1 + m.3 <= screen.1);
+        assert!(matches!(
+            ui.on_press(m.0 as i32 + 1, m.1 as i32 + 1, &settings, screen),
+            UiCommand::Paste
+        ));
+        assert!(matches!(ui.screen, Screen::Terminal));
+    }
+
+    #[test]
+    fn minimize_is_a_menu_row_that_fits_sideways() {
+        let screen = (PANEL_H, PANEL_W);
+        let settings = Settings::default();
+        let mut ui = Ui::new();
+        let p = pill(screen.0);
+        ui.on_press(p.0 as i32 + 1, p.1 as i32 + 1, &settings, screen);
+        let m = menu(screen.0);
+        assert!(m.1 + m.3 <= screen.1);
+        let row = MENU_ITEMS.iter().position(|(label, _)| *label == "Minimize").unwrap();
+        assert!(matches!(
+            ui.on_press(m.0 as i32 + 1, (m.1 + row * MENU_ROW_H) as i32 + 1, &settings, screen),
+            UiCommand::Minimize
+        ));
     }
 
     #[test]
@@ -511,7 +585,7 @@ mod tests {
             std::fs::write(format!("{dir}/{name}-menu.raw"), &fb.px).unwrap();
 
             let m = menu(fb.w);
-            ui.on_press(m.0 as i32 + 1, m.1 as i32 + 1, &settings, screen);
+            ui.on_press(m.0 as i32 + 1, (m.1 + MENU_ROW_H) as i32 + 1, &settings, screen);
             ui.draw_panel(&mut fb, screen.1);
             std::fs::write(format!("{dir}/{name}-settings.raw"), &fb.px).unwrap();
         }

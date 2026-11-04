@@ -36,7 +36,6 @@ pub const INPUT_TOUCH_RELEASE: i32 = 0x11;
 pub const INPUT_TOUCH_UPDATE: i32 = 0x12;
 pub const INPUT_PEN_PRESS: i32 = 0x20;
 pub const INPUT_PEN_RELEASE: i32 = 0x21;
-#[allow(dead_code)]
 pub const INPUT_PEN_UPDATE: i32 = 0x22;
 pub const INPUT_BTN_PRESS: i32 = 0x30;
 pub const INPUT_BTN_RELEASE: i32 = 0x31;

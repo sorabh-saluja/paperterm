@@ -1,0 +1,52 @@
+; PaperTerm runs outside the reMarkable interface, so its clipboard can't reach
+; Notes. While an AppLoad window is open, this watches the file PaperTerm copies
+; to and puts new text on the clipboard Notes pastes from. The clipboard is reached
+; through a small object built at run time, so that if an OS update moves it, only
+; this stops working and the window still opens.
+AFFECT /appload/qml/window.qml
+TRAVERSE FocusScope
+LOCATE AFTER ALL
+INSERT {
+    Timer {
+        id: paperTermClipboardBridge
+        property bool started: false
+        property string last: ""
+        property var clipboard: null
+
+        function receive(copied) {
+            if(!started) {
+                // Text from an earlier visit must not replace what is on the clipboard now.
+                started = true;
+                last = copied;
+            } else if(copied != "" && copied != last) {
+                last = copied;
+                try {
+                    if(!clipboard) {
+                        clipboard = Qt.createQmlObject("import QtQml; import com.remarkable; QtObject { function set(text) { Clipboard.setTextFromString(text); } }", paperTermClipboardBridge, "paperTermClipboard");
+                    }
+                    clipboard.set(copied);
+                    console.log("PaperTerm clipboard: passed on", copied.length, "characters");
+                } catch(e) {
+                    console.log("PaperTerm clipboard: failed:", e.message);
+                }
+            }
+        }
+
+        interval: 500
+        repeat: true
+        running: qtfbKey != -1
+        triggeredOnStart: true
+        onTriggered: {
+            var request = new XMLHttpRequest();
+            request.onreadystatechange = function() {
+                if(request.readyState == XMLHttpRequest.DONE) {
+                    paperTermClipboardBridge.receive(request.responseText);
+                }
+            };
+            request.open("GET", "file:///tmp/paperterm-clipboard");
+            request.send();
+        }
+    }
+}
+END TRAVERSE
+END AFFECT

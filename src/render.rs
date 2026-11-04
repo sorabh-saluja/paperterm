@@ -5,6 +5,7 @@ use crate::palette::Palette;
 use crate::screen::Canvas;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::Rgb;
@@ -128,6 +129,7 @@ pub fn draw_line<T: EventListener>(
     row: usize,
     left: usize,
     right: usize,
+    selected: Option<SelectionRange>,
 ) {
     let display_offset = term.grid().display_offset();
     let line = Line(row as i32 - display_offset as i32);
@@ -137,14 +139,16 @@ pub fn draw_line<T: EventListener>(
     for col in left..=right {
         let cell = &term.grid()[line][Column(col)];
         let (px, py, _, _) = area.cell_rect(col, row);
+        let is_selected = selected.is_some_and(|s| s.contains(Point::new(line, Column(col))));
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            let bg = rgb565(palette.resolve(cell.bg, colors));
+            let shown = if is_selected { cell.fg } else { cell.bg };
+            let bg = rgb565(palette.resolve(shown, colors));
             fill_rect(fb, px, py, area.cw, area.ch, bg);
             continue;
         }
         let mut fg = palette.resolve(cell.fg, colors);
         let mut bg = palette.resolve(cell.bg, colors);
-        if cell.flags.contains(Flags::INVERSE) {
+        if cell.flags.contains(Flags::INVERSE) != is_selected {
             std::mem::swap(&mut fg, &mut bg);
         }
         let fg565 = rgb565(fg);

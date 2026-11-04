@@ -213,6 +213,11 @@ pub struct PhysicalKeyboard {
 }
 
 impl PhysicalKeyboard {
+    /// Asked directly because caps lock also gives an uppercase letter.
+    pub fn shift_held(&self) -> bool {
+        self.shift
+    }
+
     pub fn press(&mut self, key: i32) -> Option<(KeyAction, bool, bool)> {
         self.down.insert(key);
         if let Some(symbol) = dead_key_symbol(key, self.alt) {

@@ -1,0 +1,68 @@
+; AppLoad's minimize button drops a full-screen app to a small window, and bringing
+; it back takes two taps. This makes it one tap each way, so a full-screen app and
+; a notebook can be switched between. PaperTerm also asks for it from its menu, by
+; writing a new value to a file, since an app has no other way to ask AppLoad.
+AFFECT /appload/qml/window.qml
+TRAVERSE FocusScope
+LOCATE BEFORE ALL
+INSERT {
+    property bool resumeFullscreen: false
+    property bool minimizeRequestSeen: false
+    property string lastMinimizeRequest: ""
+
+    function toggleMinimized() {
+        if(root.fullscreen) {
+            root.maximize();
+            root.x = (root.globalWidth - root.width) / 2;
+            root.y = 0;
+            root.resumeFullscreen = true;
+            root.minimized = true;
+        } else if(root.minimized && root.resumeFullscreen) {
+            root.resumeFullscreen = false;
+            root.minimized = false;
+            root.maximize();
+        } else {
+            root.resumeFullscreen = false;
+            root.minimized = !root.minimized;
+        }
+    }
+
+    function receiveMinimizeRequest(request) {
+        if(!root.minimizeRequestSeen) {
+            // A request left over from an earlier visit must not minimize a new window.
+            root.minimizeRequestSeen = true;
+            root.lastMinimizeRequest = request;
+        } else if(request != root.lastMinimizeRequest) {
+            root.lastMinimizeRequest = request;
+            if(!root.minimized) root.toggleMinimized();
+        }
+    }
+
+    Timer {
+        interval: 500
+        repeat: true
+        running: root.appName == "PaperTerm"
+        triggeredOnStart: true
+        onTriggered: {
+            var request = new XMLHttpRequest();
+            request.onreadystatechange = function() {
+                if(request.readyState == XMLHttpRequest.DONE) {
+                    root.receiveMinimizeRequest(request.responseText);
+                }
+            };
+            request.open("GET", "file:///tmp/paperterm-minimize");
+            request.send();
+        }
+    }
+}
+TRAVERSE Rectangle#topbar > Rectangle#minimizeButton
+LOCATE AFTER ALL
+INSERT {
+    MouseArea {
+        anchors.fill: parent
+        onClicked: () => root.toggleMinimized()
+    }
+}
+END TRAVERSE
+END TRAVERSE
+END AFFECT

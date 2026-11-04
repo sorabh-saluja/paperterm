@@ -9,6 +9,7 @@ mod palette;
 mod qtfb;
 mod render;
 mod screen;
+mod selection;
 mod session;
 mod settings;
 mod ui;
@@ -30,6 +31,7 @@ use polling::{Event as PollEvent, Events, PollMode, Poller};
 
 use crate::render::TermArea;
 use crate::screen::{Canvas, Rotation, PANEL_H, PANEL_W};
+use crate::selection::{Clipboard, Gesture};
 use crate::session::Session;
 
 const OSK_H: usize = 460;
@@ -47,9 +49,9 @@ impl EventListener for Listener {
 }
 
 #[derive(Copy, Clone)]
-struct GridSize {
-    cols: usize,
-    lines: usize,
+pub(crate) struct GridSize {
+    pub(crate) cols: usize,
+    pub(crate) lines: usize,
 }
 
 impl Dimensions for GridSize {
@@ -262,8 +264,11 @@ fn run() -> std::io::Result<()> {
     let mut buf = [0u8; 65536];
     let mut activity = true; // force first render
     let mut dirty = DirtyRegion::default();
-    // Touch-drag scrolling state on the terminal area.
-    let mut drag: Option<(i32, i32)> = None; // (dev_id, last_y)
+    // What the current press on the terminal area is doing.
+    let mut gesture = Gesture::default();
+    let mut clipboard = Clipboard::load();
+    // The selection as last drawn.
+    let mut shown_selection = None;
     let mut next_hwkbd_scan = Instant::now() + Duration::from_secs(2);
     // Redraw everything once the settings screen is out of the way.
     let mut repaint = false;
@@ -277,7 +282,11 @@ fn run() -> std::io::Result<()> {
         }
 
         events.clear();
-        poller.wait(&mut events, Some(Duration::from_millis(300)))?;
+        let mut wait = Duration::from_millis(300);
+        if let Some(deadline) = gesture.deadline() {
+            wait = wait.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        poller.wait(&mut events, Some(wait))?;
         if Instant::now() >= next_hwkbd_scan {
             next_hwkbd_scan = Instant::now() + Duration::from_secs(2);
             let has_hwkbd = hw_keyboard::present();
@@ -326,7 +335,7 @@ fn run() -> std::io::Result<()> {
                         }
                         area = term_area(&font, canvas.w, term_h);
                         resize_term(&mut term, &session, &area);
-                        drag = None;
+                        gesture = Gesture::Idle;
                         repaint = true;
                         full_refresh_due = true;
                         if ui.settings_open() {
@@ -341,6 +350,7 @@ fn run() -> std::io::Result<()> {
                                 | qtfb::INPUT_TOUCH_UPDATE
                                 | qtfb::INPUT_TOUCH_RELEASE
                                 | qtfb::INPUT_PEN_PRESS
+                                | qtfb::INPUT_PEN_UPDATE
                                 | qtfb::INPUT_PEN_RELEASE
                         ) {
                             (iev.x, iev.y) = rotation.to_canvas(iev.x, iev.y);
@@ -375,7 +385,8 @@ fn run() -> std::io::Result<()> {
                                 &osk_font,
                                 &area,
                                 &mut dirty,
-                                &mut drag,
+                                &mut gesture,
+                                &mut clipboard,
                                 &mut activity,
                             )?,
                             ui::UiCommand::Nothing => {}
@@ -420,6 +431,15 @@ fn run() -> std::io::Result<()> {
                                 repaint = true;
                                 full_refresh_due = true;
                             }
+                            ui::UiCommand::Copy => copy_selection(&mut term, &mut clipboard),
+                            ui::UiCommand::Paste => {
+                                paste(&mut term, &session, &clipboard)?;
+                                repaint = true;
+                            }
+                            ui::UiCommand::Minimize => {
+                                request_minimize();
+                                repaint = true;
+                            }
                             ui::UiCommand::Exit => break 'main,
                             ui::UiCommand::EndSession => {
                                 let _ = session.end();
@@ -431,6 +451,8 @@ fn run() -> std::io::Result<()> {
                 _ => {}
             }
         }
+
+        gesture.tick(Instant::now(), &mut term, &area);
 
         // Term-emitted events (query replies etc.).
         while let Ok(event) = event_rx.try_recv() {
@@ -465,11 +487,12 @@ fn run() -> std::io::Result<()> {
             term.reset_damage();
             redraw_all_lines = false;
 
+            let selected = term.selection.as_ref().and_then(|s| s.to_range(&term));
             let fb = &mut canvas;
             match damage {
                 None => {
                     for row in 0..area.rows {
-                        render::draw_line(fb, &font, &palette, &term, &area, row, 0, area.cols - 1);
+                        render::draw_line(fb, &font, &palette, &term, &area, row, 0, area.cols - 1, selected);
                     }
                     dirty.add(0, area.y0, fb.w, area.rows * area.ch);
                 }
@@ -480,11 +503,40 @@ fn run() -> std::io::Result<()> {
                         }
                         let left = b.left.min(area.cols - 1);
                         let right = b.right.min(area.cols - 1);
-                        render::draw_line(fb, &font, &palette, &term, &area, b.line, left, right);
+                        render::draw_line(fb, &font, &palette, &term, &area, b.line, left, right, selected);
                         let (x, y, _, _) = area.cell_rect(left, b.line);
                         dirty.add(x, y, (right - left + 1) * area.cw, area.ch);
                     }
                 }
+            }
+        }
+
+        if !ui.settings_open() {
+            // A selection changes without the terminal counting it as damage.
+            let selected = term.selection.as_ref().and_then(|s| s.to_range(&term));
+            let can_copy = selected.is_some() && !gesture.selecting();
+            let mut rows = Vec::new();
+            if selected != shown_selection {
+                let offset = term.grid().display_offset();
+                for range in [shown_selection, selected].into_iter().flatten() {
+                    rows.extend(selection::visible_rows(range, offset, area.rows));
+                }
+                shown_selection = selected;
+            }
+            if can_copy != ui.can_copy {
+                ui.can_copy = can_copy;
+                let (x, y, w, h) = ui::copy_button(canvas.w);
+                dirty.add(x, y, w, h);
+                if !can_copy {
+                    render::fill_rect(&mut canvas, x, y, w, h, render::WHITE);
+                    rows.extend(0..=((y + h) / area.ch).min(area.rows - 1));
+                }
+            }
+            rows.sort_unstable();
+            rows.dedup();
+            for row in rows {
+                render::draw_line(&mut canvas, &font, &palette, &term, &area, row, 0, area.cols - 1, selected);
+                dirty.add(0, area.y0 + row * area.ch, canvas.w, area.ch);
             }
         }
 
@@ -533,7 +585,8 @@ fn handle_input(
     font: &font::Font,
     area: &TermArea,
     dirty: &mut DirtyRegion,
-    drag: &mut Option<(i32, i32)>,
+    gesture: &mut Gesture,
+    clipboard: &mut Clipboard,
     activity: &mut bool,
 ) -> std::io::Result<()> {
     match ev.input_type {
@@ -541,11 +594,7 @@ fn handle_input(
         qtfb::INPUT_VKB_PRESS => {
             if let Some((action, ctrl, alt)) = keys::decode_vkb(ev.x) {
                 let bytes = keys::encode(action, ctrl, alt, *term.mode());
-                session.send_input(&bytes)?;
-                if term.grid().display_offset() != 0 {
-                    term.scroll_display(Scroll::Bottom);
-                    *activity = true;
-                }
+                send_typed(&bytes, term, session, activity)?;
             }
         }
         // Physical keyboards arrive as bare Qt::Key values, focused window only.
@@ -556,12 +605,22 @@ fn handle_input(
                 physical.release(ev.x)
             };
             if let Some((action, ctrl, alt)) = typed {
-                let bytes = keys::encode(action, ctrl, alt, *term.mode());
-                session.send_input(&bytes)?;
-                if term.grid().display_offset() != 0 {
-                    term.scroll_display(Scroll::Bottom);
-                    *activity = true;
+                if ctrl && !alt && physical.shift_held() {
+                    match action {
+                        keys::KeyAction::Char('c' | 'C') => {
+                            copy_selection(term, clipboard);
+                            return Ok(());
+                        }
+                        keys::KeyAction::Char('v' | 'V') => {
+                            paste(term, session, clipboard)?;
+                            *activity = true;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
                 }
+                let bytes = keys::encode(action, ctrl, alt, *term.mode());
+                send_typed(&bytes, term, session, activity)?;
             }
         }
         qtfb::INPUT_TOUCH_PRESS | qtfb::INPUT_PEN_PRESS => {
@@ -569,31 +628,68 @@ fn handle_input(
                 let osk_events = kbd.press(ev.dev_id, ev.x, ev.y, canvas, font);
                 process_osk_events(osk_events, client, term, session, dirty, activity)?;
             } else {
-                *drag = Some((ev.dev_id, ev.y));
+                let pen = ev.input_type == qtfb::INPUT_PEN_PRESS;
+                gesture.press(ev.dev_id, pen, ev.x, ev.y, Instant::now());
             }
         }
-        qtfb::INPUT_TOUCH_UPDATE => {
-            if let Some((id, last_y)) = *drag {
-                if id == ev.dev_id {
-                    let dy = ev.y - last_y;
-                    let lines = dy / area.ch as i32;
-                    if lines != 0 {
-                        // Drag down => view earlier history (positive Delta).
-                        term.scroll_display(Scroll::Delta(lines));
-                        *drag = Some((id, last_y + lines * area.ch as i32));
-                        *activity = true;
-                    }
-                }
+        qtfb::INPUT_TOUCH_UPDATE | qtfb::INPUT_PEN_UPDATE => {
+            let pen = ev.input_type == qtfb::INPUT_PEN_UPDATE;
+            if gesture.moved((ev.dev_id, pen), ev.x, ev.y, term, area) {
+                *activity = true;
             }
         }
         qtfb::INPUT_TOUCH_RELEASE | qtfb::INPUT_PEN_RELEASE => {
-            if drag.map(|(id, _)| id) == Some(ev.dev_id) {
-                *drag = None;
-            }
+            let pen = ev.input_type == qtfb::INPUT_PEN_RELEASE;
+            gesture.release(ev.dev_id, pen, term);
             let osk_events = kbd.release(ev.dev_id, canvas, font);
             process_osk_events(osk_events, client, term, session, dirty, activity)?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// An app can't ask AppLoad for anything, so qmd/appload-minimize.qmd watches this
+/// file for a new value.
+fn request_minimize() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    if let Err(e) = std::fs::write("/tmp/paperterm-minimize", now.as_nanos().to_string()) {
+        eprintln!("paperterm: could not ask to minimize: {e}");
+    }
+}
+
+/// Typing clears a selection and returns to the live screen.
+fn send_typed(
+    bytes: &[u8],
+    term: &mut Term<Listener>,
+    session: &Session,
+    activity: &mut bool,
+) -> std::io::Result<()> {
+    session.send_input(bytes)?;
+    term.selection = None;
+    if term.grid().display_offset() != 0 {
+        term.scroll_display(Scroll::Bottom);
+        *activity = true;
+    }
+    Ok(())
+}
+
+fn copy_selection(term: &mut Term<Listener>, clipboard: &mut Clipboard) {
+    if let Some(text) = term.selection_to_string() {
+        if let Err(e) = clipboard.set(text) {
+            eprintln!("paperterm: could not save the clipboard: {e}");
+        }
+    }
+    term.selection = None;
+}
+
+fn paste(term: &mut Term<Listener>, session: &Session, clipboard: &Clipboard) -> std::io::Result<()> {
+    if let Some(text) = clipboard.text() {
+        session.send_input(&selection::paste_bytes(text, *term.mode()))?;
+        term.selection = None;
+        term.scroll_display(Scroll::Bottom);
     }
     Ok(())
 }
@@ -610,11 +706,7 @@ fn process_osk_events(
         match oev {
             osk::OskEvent::Send(action, ctrl, alt) => {
                 let bytes = keys::encode(action, ctrl, alt, *term.mode());
-                session.send_input(&bytes)?;
-                if term.grid().display_offset() != 0 {
-                    term.scroll_display(Scroll::Bottom);
-                    *activity = true;
-                }
+                send_typed(&bytes, term, session, activity)?;
             }
             osk::OskEvent::FullRefresh => {
                 let _ = client.request_full_refresh();
