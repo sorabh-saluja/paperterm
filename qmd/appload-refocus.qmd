@@ -1,0 +1,15 @@
+; AppLoad takes keyboard focus away when it hides a window (minimize, or while
+; dragging) and doesn't give it back, so keys stop reaching the app.
+AFFECT /appload/qml/window.qml
+TRAVERSE FocusScope
+LOCATE AFTER ALL
+INSERT {
+    Connections {
+        target: mainWindowView
+        function onVisibleChanged() {
+            if(mainWindowView.visible && qtfbKey != -1) windowCanvas.forceActiveFocus();
+        }
+    }
+}
+END TRAVERSE
+END AFFECT
