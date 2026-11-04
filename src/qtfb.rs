@@ -22,9 +22,11 @@ pub const UPDATE_PARTIAL: i32 = 1;
 /// FBFMT_RMPP_RGB565: native 1620x2160, 2 bytes/pixel, stride = 3240.
 pub const FBFMT_RMPP_RGB565: u8 = 3;
 
-#[allow(dead_code)]
 pub const REFRESH_MODE_UFAST: i32 = 0;
 pub const REFRESH_MODE_FAST: i32 = 1;
+pub const REFRESH_MODE_ANIMATE: i32 = 2;
+pub const REFRESH_MODE_CONTENT: i32 = 3;
+pub const REFRESH_MODE_UI: i32 = 4;
 
 // Input event types (server -> client).
 pub const INPUT_TOUCH_PRESS: i32 = 0x10;

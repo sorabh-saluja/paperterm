@@ -15,7 +15,7 @@ framebuffer protocol, packaged as an AppLoad (xovi) app.
  alacritty_terminal::Term        ← full xterm/VTE state machine + damage tracking
    │ damaged cells only
    ▼
- renderer (embedded PSF2 bitmap font, no AA)
+ renderer (embedded TrueType and PSF2 fonts, cached per glyph)
    │ pixel writes
    ▼
  qtfb shared-memory framebuffer  ← UPDATE_PARTIAL(x, y, w, h) per damage rect
@@ -27,6 +27,10 @@ framebuffer protocol, packaged as an AppLoad (xovi) app.
 Input (touch / on-screen keyboard / physical keyboards) arrives over the same
 qtfb channel; the OSK is drawn by us and partial-updated so typing never
 flashes the screen.
+
+## Settings
+
+Tap **Menu** at the top right, in a window or in full screen, for Settings, Refresh screen and Exit. Settings has the font, size, text style, refresh mode and automatic ghost cleanup, with a live preview. Choices are saved in `~/.config/paperterm/settings.conf`.
 
 ## Install
 

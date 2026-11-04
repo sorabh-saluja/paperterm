@@ -8,6 +8,8 @@ mod osk;
 mod palette;
 mod qtfb;
 mod render;
+mod settings;
+mod ui;
 
 use std::io::{ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
@@ -30,9 +32,8 @@ use crate::render::{TermArea, SCREEN_W};
 const SCREEN_H: usize = 2160;
 const OSK_H: usize = 460;
 
-const FONT_16X32: &[u8] = include_bytes!("../fonts/spleen-16x32.psfu");
-const FONT_12X24: &[u8] = include_bytes!("../fonts/spleen-12x24.psfu");
-const FONT_32X64: &[u8] = include_bytes!("../fonts/spleen-32x64.psfu");
+/// The on-screen keyboard keeps its own font, so its labels always fit the keys.
+const OSK_FONT_SIZE: usize = 36;
 
 #[derive(Clone)]
 struct Listener(mpsc::Sender<Event>);
@@ -88,11 +89,40 @@ impl DirtyRegion {
         });
     }
 
-    fn flush(&mut self, client: &qtfb::QtfbClient) {
-        if let Some((x, y, w, h)) = self.rect.take() {
-            let _ = client.update_partial(x as i32, y as i32, w as i32, h as i32);
-        }
+    /// Returns whether anything was sent to the screen.
+    fn flush(&mut self, client: &qtfb::QtfbClient) -> bool {
+        let Some((x, y, w, h)) = self.rect.take() else {
+            return false;
+        };
+        let _ = client.update_partial(x as i32, y as i32, w as i32, h as i32);
+        true
     }
+}
+
+fn term_area(font: &font::Font, term_h: usize) -> TermArea {
+    TermArea {
+        cols: SCREEN_W / font.width,
+        rows: term_h / font.height,
+        cw: font.width,
+        ch: font.height,
+        x0: (SCREEN_W % font.width) / 2,
+        y0: 0,
+    }
+}
+
+/// Fit the terminal and the shell to `area`.
+fn resize_term(term: &mut Term<Listener>, pty: &mut tty::Pty, area: &TermArea) {
+    term.resize(GridSize {
+        cols: area.cols,
+        lines: area.rows,
+    });
+    pty.on_resize(WindowSize {
+        num_cols: area.cols as u16,
+        num_lines: area.rows as u16,
+        cell_width: area.cw as u16,
+        cell_height: area.ch as u16,
+    });
+    term.scroll_display(Scroll::Bottom);
 }
 
 fn single_instance_lock() -> bool {
@@ -128,12 +158,10 @@ fn run() -> std::io::Result<()> {
         return Ok(());
     }
 
-    let font_data: &[u8] = match std::env::var("PAPERTERM_FONT").as_deref() {
-        Ok("12x24") => FONT_12X24,
-        Ok("32x64") => FONT_32X64,
-        _ => FONT_16X32,
-    };
-    let font = font::Psf2Font::parse(font_data).map_err(std::io::Error::other)?;
+    let mut settings = settings::Settings::load();
+    let mut font = font::Font::load(settings.font, settings.size, settings.crisp)
+        .map_err(std::io::Error::other)?;
+    let osk_font = font::Font::load(0, OSK_FONT_SIZE, false).map_err(std::io::Error::other)?;
 
     let mut osk_visible = !hw_keyboard::present();
 
@@ -143,14 +171,7 @@ fn run() -> std::io::Result<()> {
     } else {
         SCREEN_H
     };
-    let mut area = TermArea {
-        cols: SCREEN_W / font.width,
-        rows: term_h / font.height,
-        cw: font.width,
-        ch: font.height,
-        x0: (SCREEN_W % font.width) / 2,
-        y0: 0,
-    };
+    let mut area = term_area(&font, term_h);
     eprintln!(
         "paperterm: starting, {}x{} cells, font {}x{}, key {}",
         area.cols, area.rows, font.width, font.height, key
@@ -159,8 +180,8 @@ fn run() -> std::io::Result<()> {
     // ---- qtfb ----
     let mut client =
         qtfb::QtfbClient::connect(key, qtfb::FBFMT_RMPP_RGB565, SCREEN_W, SCREEN_H, 2)?;
-    // Low-latency waveform for typing. NOTE: server stalls this connection 1s.
-    let _ = client.set_refresh_mode(qtfb::REFRESH_MODE_FAST);
+    // NOTE: server stalls this connection 1s.
+    let _ = client.set_refresh_mode(settings::REFRESH_OPTIONS[settings.refresh].mode);
 
     // ---- terminal + pty ----
     tty::setup_env();
@@ -219,6 +240,7 @@ fn run() -> std::io::Result<()> {
     let palette = palette::Palette::new();
     let mut kbd = osk::Osk::new(term_h, OSK_H);
     let mut physical = keys::PhysicalKeyboard::default();
+    let mut ui = ui::Ui::new();
 
     // Initial paint: white screen, keyboard, full update.
     render::fill_rect(
@@ -232,8 +254,9 @@ fn run() -> std::io::Result<()> {
     {
         let fb = client.framebuffer();
         if osk_visible {
-            kbd.draw_all(fb, &font);
+            kbd.draw_all(fb, &osk_font);
         }
+        ui.draw_overlay(fb);
     }
     client.update_all()?;
 
@@ -244,6 +267,11 @@ fn run() -> std::io::Result<()> {
     // Touch-drag scrolling state on the terminal area.
     let mut drag: Option<(i32, i32)> = None; // (dev_id, last_y)
     let mut next_hwkbd_scan = Instant::now() + Duration::from_secs(2);
+    // Redraw everything once the settings screen is out of the way.
+    let mut repaint = false;
+    let mut redraw_all_lines = false;
+    let mut full_refresh_due = false;
+    let mut updates_since_cleanup = 0u32;
 
     'main: loop {
         if sigterm.load(Ordering::Relaxed) {
@@ -255,55 +283,18 @@ fn run() -> std::io::Result<()> {
         if Instant::now() >= next_hwkbd_scan {
             next_hwkbd_scan = Instant::now() + Duration::from_secs(2);
             let has_hwkbd = hw_keyboard::present();
-            if has_hwkbd && osk_visible {
-                osk_visible = false;
-                kbd.y0 = SCREEN_H;
-                term_h = SCREEN_H;
-                area.rows = term_h / font.height;
-                let new_size = GridSize {
-                    cols: area.cols,
-                    lines: area.rows,
-                };
-                term.resize(new_size);
-                pty.on_resize(WindowSize {
-                    num_cols: area.cols as u16,
-                    num_lines: area.rows as u16,
-                    cell_width: font.width as u16,
-                    cell_height: font.height as u16,
-                });
-                term.scroll_display(Scroll::Bottom);
-                render::fill_rect(
-                    client.framebuffer(),
-                    0,
-                    0,
-                    SCREEN_W,
-                    SCREEN_H,
-                    render::WHITE,
-                );
-                dirty.add(0, 0, SCREEN_W, SCREEN_H);
-                activity = true;
-            } else if !has_hwkbd && !osk_visible {
-                osk_visible = true;
-                term_h = SCREEN_H - OSK_H;
-                area.rows = term_h / font.height;
-                let new_size = GridSize {
-                    cols: area.cols,
-                    lines: area.rows,
-                };
-                term.resize(new_size);
-                pty.on_resize(WindowSize {
-                    num_cols: area.cols as u16,
-                    num_lines: area.rows as u16,
-                    cell_width: font.width as u16,
-                    cell_height: font.height as u16,
-                });
-                kbd = osk::Osk::new(term_h, OSK_H);
-                term.scroll_display(Scroll::Bottom);
-                let fb = client.framebuffer();
-                render::fill_rect(fb, 0, 0, SCREEN_W, SCREEN_H, render::WHITE);
-                kbd.draw_all(fb, &font);
-                dirty.add(0, 0, SCREEN_W, SCREEN_H);
-                activity = true;
+            if has_hwkbd == osk_visible {
+                osk_visible = !has_hwkbd;
+                if osk_visible {
+                    term_h = SCREEN_H - OSK_H;
+                    kbd = osk::Osk::new(term_h, OSK_H);
+                } else {
+                    term_h = SCREEN_H;
+                    kbd.y0 = SCREEN_H;
+                }
+                area = term_area(&font, term_h);
+                resize_term(&mut term, &mut pty, &area);
+                repaint = true;
             }
         }
 
@@ -332,19 +323,75 @@ fn run() -> std::io::Result<()> {
                         Err(_) => break 'main, // window closed
                     };
                     for iev in input {
-                        handle_input(
-                            iev,
-                            &mut kbd,
-                            &mut physical,
-                            &mut client,
-                            &mut term,
-                            &mut pty,
-                            &font,
-                            &area,
-                            &mut dirty,
-                            &mut drag,
-                            &mut activity,
-                        )?;
+                        let command = match iev.input_type {
+                            qtfb::INPUT_TOUCH_PRESS | qtfb::INPUT_PEN_PRESS => {
+                                ui.on_press(iev.x, iev.y, &settings)
+                            }
+                            // Typing doesn't reach the shell behind the settings screen.
+                            qtfb::INPUT_BTN_PRESS if ui.settings_open() => {
+                                match physical.press(iev.x) {
+                                    Some((keys::KeyAction::Esc, _, _)) => ui.cancel_settings(),
+                                    _ => ui::UiCommand::Nothing,
+                                }
+                            }
+                            qtfb::INPUT_VKB_PRESS if ui.settings_open() => ui::UiCommand::Nothing,
+                            _ => ui::UiCommand::Pass,
+                        };
+                        match command {
+                            ui::UiCommand::Pass => handle_input(
+                                iev,
+                                &mut kbd,
+                                &mut physical,
+                                &mut client,
+                                &mut term,
+                                &mut pty,
+                                &osk_font,
+                                &area,
+                                &mut dirty,
+                                &mut drag,
+                                &mut activity,
+                            )?,
+                            ui::UiCommand::Nothing => {}
+                            ui::UiCommand::MenuOpened => {
+                                ui.draw_overlay(client.framebuffer());
+                                let (x, y, w, h) = ui.overlay_rect();
+                                dirty.add(x, y, w, h);
+                            }
+                            ui::UiCommand::Closed => repaint = true,
+                            ui::UiCommand::PanelChanged => {
+                                ui.draw_panel(client.framebuffer(), term_h);
+                                dirty.add(0, 0, SCREEN_W, SCREEN_H);
+                            }
+                            ui::UiCommand::RefreshScreen => {
+                                repaint = true;
+                                full_refresh_due = true;
+                            }
+                            ui::UiCommand::CleanNow => {
+                                let _ = client.request_full_refresh();
+                            }
+                            ui::UiCommand::Apply(new) => {
+                                if (new.font, new.size, new.crisp)
+                                    != (settings.font, settings.size, settings.crisp)
+                                {
+                                    font = font::Font::load(new.font, new.size, new.crisp)
+                                        .map_err(std::io::Error::other)?;
+                                    area = term_area(&font, term_h);
+                                    resize_term(&mut term, &mut pty, &area);
+                                }
+                                if new.refresh != settings.refresh {
+                                    let mode = settings::REFRESH_OPTIONS[new.refresh].mode;
+                                    let _ = client.set_refresh_mode(mode);
+                                }
+                                settings = new;
+                                if let Err(e) = settings.save() {
+                                    eprintln!("paperterm: could not save settings: {e}");
+                                }
+                                updates_since_cleanup = 0;
+                                repaint = true;
+                                full_refresh_due = true;
+                            }
+                            ui::UiCommand::Exit => break 'main,
+                        }
                     }
                 }
                 _ => {}
@@ -361,13 +408,28 @@ fn run() -> std::io::Result<()> {
             }
         }
 
-        if activity {
+        if repaint && !ui.settings_open() {
+            repaint = false;
+            let fb = client.framebuffer();
+            render::fill_rect(fb, 0, 0, SCREEN_W, SCREEN_H, render::WHITE);
+            if osk_visible {
+                kbd.draw_all(fb, &osk_font);
+            }
+            redraw_all_lines = true;
+            activity = true;
+            dirty.add(0, 0, SCREEN_W, SCREEN_H);
+        }
+
+        // Output arriving behind the settings screen is drawn when it closes.
+        if activity && !ui.settings_open() {
             activity = false;
             let damage: Option<Vec<LineDamageBounds>> = match term.damage() {
                 TermDamage::Full => None,
+                TermDamage::Partial(_) if redraw_all_lines => None,
                 TermDamage::Partial(it) => Some(it.collect()),
             };
             term.reset_damage();
+            redraw_all_lines = false;
 
             let fb = client.framebuffer();
             match damage {
@@ -392,7 +454,26 @@ fn run() -> std::io::Result<()> {
             }
         }
 
-        dirty.flush(&client);
+        if let Some(rect) = dirty.rect {
+            if !ui.settings_open() && ui.overlay_touches(rect) {
+                ui.draw_overlay(client.framebuffer());
+                let (x, y, w, h) = ui.overlay_rect();
+                dirty.add(x, y, w, h);
+            }
+        }
+
+        if dirty.flush(&client) && !ui.settings_open() {
+            let cleanup = settings::CLEANUP_OPTIONS[settings.cleanup].1;
+            updates_since_cleanup += 1;
+            if cleanup > 0 && updates_since_cleanup >= cleanup {
+                full_refresh_due = true;
+            }
+        }
+        if full_refresh_due && !ui.settings_open() {
+            full_refresh_due = false;
+            updates_since_cleanup = 0;
+            let _ = client.request_full_refresh();
+        }
     }
 
     eprintln!("paperterm: exiting");
@@ -408,7 +489,7 @@ fn handle_input(
     client: &mut qtfb::QtfbClient,
     term: &mut Term<Listener>,
     pty: &mut tty::Pty,
-    font: &font::Psf2Font,
+    font: &font::Font,
     area: &TermArea,
     dirty: &mut DirtyRegion,
     drag: &mut Option<(i32, i32)>,

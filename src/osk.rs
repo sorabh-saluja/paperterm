@@ -2,7 +2,7 @@
 //! qtfb touch events. Always visible — unlike the system overlay keyboard it
 //! never covers the shell prompt, and key feedback is a tiny partial update.
 
-use crate::font::Psf2Font;
+use crate::font::Font;
 use crate::keys::KeyAction;
 use crate::render::{self, SCREEN_W};
 use std::collections::HashMap;
@@ -194,7 +194,7 @@ impl Osk {
     }
 
     /// Touch press at (x, y): returns events to act on.
-    pub fn press(&mut self, dev_id: i32, x: i32, y: i32, fb: &mut [u8], font: &Psf2Font) -> Vec<OskEvent> {
+    pub fn press(&mut self, dev_id: i32, x: i32, y: i32, fb: &mut [u8], font: &Font) -> Vec<OskEvent> {
         let Some(idx) = self.hit(x, y) else { return vec![] };
         self.pressed.insert(dev_id, idx);
         let mut dirty = vec![];
@@ -245,13 +245,13 @@ impl Osk {
         out
     }
 
-    pub fn release(&mut self, dev_id: i32, fb: &mut [u8], font: &Psf2Font) -> Vec<OskEvent> {
+    pub fn release(&mut self, dev_id: i32, fb: &mut [u8], font: &Font) -> Vec<OskEvent> {
         let Some(idx) = self.pressed.remove(&dev_id) else { return vec![] };
         self.draw_key(fb, font, idx, false);
         vec![OskEvent::Redraw(vec![self.key_rect(idx)])]
     }
 
-    fn consume_oneshots(&mut self, fb: &mut [u8], font: &Psf2Font) -> Vec<(usize, usize, usize, usize)> {
+    fn consume_oneshots(&mut self, fb: &mut [u8], font: &Font) -> Vec<(usize, usize, usize, usize)> {
         let mut dirty = vec![];
         let mut shift_changed = false;
         for m in [Mod::Shift, Mod::Ctrl, Mod::Alt] {
@@ -285,7 +285,7 @@ impl Osk {
         (k.x, k.y, k.w, k.h)
     }
 
-    pub fn draw_all(&self, fb: &mut [u8], font: &Psf2Font) {
+    pub fn draw_all(&self, fb: &mut [u8], font: &Font) {
         render::fill_rect(fb, 0, self.y0, SCREEN_W, self.height, render::WHITE);
         for i in 0..self.keys.len() {
             let pressed = self.pressed.values().any(|&p| p == i);
@@ -293,11 +293,11 @@ impl Osk {
         }
     }
 
-    fn draw_key(&self, fb: &mut [u8], font: &Psf2Font, idx: usize, pressed: bool) {
+    fn draw_key(&self, fb: &mut [u8], font: &Font, idx: usize, pressed: bool) {
         self.draw_key_i(fb, font, idx, pressed);
     }
 
-    fn draw_key_i(&self, fb: &mut [u8], font: &Psf2Font, idx: usize, pressed: bool) {
+    fn draw_key_i(&self, fb: &mut [u8], font: &Font, idx: usize, pressed: bool) {
         let k = &self.keys[idx];
         let (mut fg, mut bg) = (render::BLACK, render::WHITE);
         let latched = match k.def {

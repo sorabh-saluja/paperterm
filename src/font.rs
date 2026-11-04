@@ -3,7 +3,179 @@
 //! unicode table terminated per-glyph by 0xFF, 0xFE starting ignorable
 //! combining sequences).
 
+use ab_glyph::{point, Font as _, FontRef, PxScale, ScaleFont};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
+
+pub const DEFAULT_SIZE: usize = 48;
+const OUTLINE_SIZES: [usize; 14] = [28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80];
+
+const JETBRAINS: &[u8] = include_bytes!("../fonts/JetBrainsMono-Medium.ttf");
+const FIRA: &[u8] = include_bytes!("../fonts/FiraCode-Medium.ttf");
+const HACK: &[u8] = include_bytes!("../fonts/Hack-Regular.ttf");
+const DEJAVU: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
+const SPLEEN: &[(usize, &[u8])] = &[
+    (24, include_bytes!("../fonts/spleen-12x24.psfu")),
+    (32, include_bytes!("../fonts/spleen-16x32.psfu")),
+    (64, include_bytes!("../fonts/spleen-32x64.psfu")),
+];
+
+enum Source {
+    Outline(&'static [u8]),
+    Bitmap(&'static [(usize, &'static [u8])]),
+}
+
+pub struct FontChoice {
+    pub name: &'static str,
+    source: Source,
+}
+
+pub const FONTS: &[FontChoice] = &[
+    FontChoice { name: "JetBrains Mono", source: Source::Outline(JETBRAINS) },
+    FontChoice { name: "Fira Code", source: Source::Outline(FIRA) },
+    FontChoice { name: "Hack", source: Source::Outline(HACK) },
+    FontChoice { name: "DejaVu Sans Mono", source: Source::Outline(DEJAVU) },
+    FontChoice { name: "Spleen", source: Source::Bitmap(SPLEEN) },
+];
+
+impl FontChoice {
+    /// The sizes this font offers, smallest first. Size is the line height in pixels.
+    pub fn sizes(&self) -> Vec<usize> {
+        match self.source {
+            Source::Outline(_) => OUTLINE_SIZES.to_vec(),
+            Source::Bitmap(faces) => faces.iter().map(|f| f.0).collect(),
+        }
+    }
+
+    pub fn nearest_size(&self, size: usize) -> usize {
+        self.sizes()
+            .into_iter()
+            .min_by_key(|s| s.abs_diff(size))
+            .unwrap_or(size)
+    }
+}
+
+enum Raster {
+    Outline {
+        face: FontRef<'static>,
+        /// Covers symbols the chosen face lacks.
+        fallback: FontRef<'static>,
+        px: f32,
+        baseline: f32,
+    },
+    Bitmap(Psf2Font),
+}
+
+/// A monospace font at one size. Every glyph becomes one cell of coverage bytes
+/// (0 = background, 255 = ink), whatever kind of font it came from.
+pub struct Font {
+    pub width: usize,
+    pub height: usize,
+    crisp: bool,
+    raster: Raster,
+    cache: RefCell<HashMap<char, Rc<[u8]>>>,
+}
+
+impl Font {
+    /// `index` is a position in FONTS. `crisp` draws pure black and white, with
+    /// no grey edges.
+    pub fn load(index: usize, size: usize, crisp: bool) -> Result<Self, String> {
+        let raster = match FONTS[index].source {
+            Source::Outline(data) => {
+                let face = FontRef::try_from_slice(data).map_err(|e| e.to_string())?;
+                let fallback = FontRef::try_from_slice(DEJAVU).map_err(|e| e.to_string())?;
+                let scaled = face.as_scaled(PxScale::from(size as f32));
+                Raster::Outline {
+                    baseline: scaled.ascent().round(),
+                    px: size as f32,
+                    face,
+                    fallback,
+                }
+            }
+            Source::Bitmap(faces) => {
+                let data = faces
+                    .iter()
+                    .find(|f| f.0 == size)
+                    .or(faces.first())
+                    .ok_or("bitmap font has no sizes")?
+                    .1;
+                Raster::Bitmap(Psf2Font::parse(data)?)
+            }
+        };
+        let (width, height) = match &raster {
+            Raster::Outline { face, px, .. } => {
+                let scaled = face.as_scaled(PxScale::from(*px));
+                let advance = scaled.h_advance(face.glyph_id('M'));
+                let height = scaled.ascent() - scaled.descent();
+                (advance.round() as usize, height.ceil() as usize)
+            }
+            Raster::Bitmap(psf) => (psf.width, psf.height),
+        };
+        Ok(Self {
+            width,
+            height,
+            crisp,
+            raster,
+            cache: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// `width * height` coverage bytes for `c`, top row first.
+    pub fn glyph(&self, c: char) -> Rc<[u8]> {
+        if let Some(cell) = self.cache.borrow().get(&c) {
+            return Rc::clone(cell);
+        }
+        let cell: Rc<[u8]> = self.rasterize(c).into();
+        self.cache.borrow_mut().insert(c, Rc::clone(&cell));
+        cell
+    }
+
+    fn rasterize(&self, c: char) -> Vec<u8> {
+        let mut cell = vec![0u8; self.width * self.height];
+        match &self.raster {
+            Raster::Bitmap(psf) => {
+                let bits = psf.glyph(c);
+                let bpr = psf.bytes_per_row();
+                for y in 0..self.height {
+                    for x in 0..self.width {
+                        if bits[y * bpr + x / 8] & (0x80 >> (x % 8)) != 0 {
+                            cell[y * self.width + x] = 255;
+                        }
+                    }
+                }
+            }
+            Raster::Outline { face, fallback, px, baseline } => {
+                let source = if face.glyph_id(c).0 != 0 { face } else { fallback };
+                let id = source.glyph_id(c);
+                // A fallback glyph can be wider than our cell: shrink it to fit.
+                let advance = source.as_scaled(PxScale::from(*px)).h_advance(id);
+                let fit = (self.width as f32 / advance.max(1.0)).min(1.0);
+                let glyph = id.with_scale_and_position(*px * fit, point(0.0, *baseline));
+                if let Some(outline) = source.outline_glyph(glyph) {
+                    let bounds = outline.px_bounds();
+                    outline.draw(|gx, gy, coverage| {
+                        let x = bounds.min.x as i32 + gx as i32;
+                        let y = bounds.min.y as i32 + gy as i32;
+                        if x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height {
+                            let i = y as usize * self.width + x as usize;
+                            cell[i] = cell[i].max(self.shade(coverage));
+                        }
+                    });
+                }
+            }
+        }
+        cell
+    }
+
+    fn shade(&self, coverage: f32) -> u8 {
+        if self.crisp {
+            return if coverage >= 0.5 { 255 } else { 0 };
+        }
+        // Thin grey edges wash out on e-ink, so lean towards ink.
+        (coverage.clamp(0.0, 1.0).powf(0.7) * 255.0) as u8
+    }
+}
 
 pub struct Psf2Font {
     pub width: usize,
@@ -104,5 +276,42 @@ fn utf8_len(first: u8) -> usize {
         0xC0..=0xDF => 2,
         0xE0..=0xEF => 3,
         _ => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ink(font: &Font, c: char) -> usize {
+        font.glyph(c).iter().filter(|&&a| a > 0).count()
+    }
+
+    #[test]
+    fn every_font_loads_at_every_size_with_ink_and_blank_space() {
+        for (i, choice) in FONTS.iter().enumerate() {
+            for size in choice.sizes() {
+                let font = Font::load(i, size, false).unwrap();
+                assert!(font.width > 0 && font.height > 0, "{}", choice.name);
+                assert_eq!(font.glyph('A').len(), font.width * font.height);
+                assert!(ink(&font, 'A') > 0, "{} {} has no ink", choice.name, size);
+                assert_eq!(ink(&font, ' '), 0, "{} {} space has ink", choice.name, size);
+            }
+        }
+    }
+
+    #[test]
+    fn crisp_text_has_no_grey() {
+        let font = Font::load(0, DEFAULT_SIZE, true).unwrap();
+        assert!(font.glyph('g').iter().all(|&a| a == 0 || a == 255));
+        let smooth = Font::load(0, DEFAULT_SIZE, false).unwrap();
+        assert!(smooth.glyph('g').iter().any(|&a| a != 0 && a != 255));
+    }
+
+    #[test]
+    fn missing_symbols_fall_back_to_dejavu() {
+        // Braille is in DejaVu Sans Mono but not in Hack.
+        let font = Font::load(2, DEFAULT_SIZE, false).unwrap();
+        assert!(ink(&font, '\u{28FF}') > 0);
     }
 }

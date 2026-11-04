@@ -1,6 +1,6 @@
 //! Pixel-level drawing into the RGB565 shared-memory framebuffer.
 
-use crate::font::Psf2Font;
+use crate::font::Font;
 use crate::palette::Palette;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::index::{Column, Line, Point};
@@ -52,7 +52,7 @@ pub fn invert_rect(fb: &mut [u8], x: usize, y: usize, w: usize, h: usize) {
 /// Draw one glyph cell. `bold` uses classic double-strike.
 pub fn draw_glyph(
     fb: &mut [u8],
-    font: &Psf2Font,
+    font: &Font,
     x: usize,
     y: usize,
     c: char,
@@ -61,22 +61,38 @@ pub fn draw_glyph(
     bold: bool,
 ) {
     let glyph = font.glyph(c);
-    let bpr = font.bytes_per_row();
     for gy in 0..font.height {
-        let row = &glyph[gy * bpr..(gy + 1) * bpr];
+        let row = &glyph[gy * font.width..(gy + 1) * font.width];
         let py = y + gy;
-        let mut prev_on = false;
-        for gx in 0..font.width {
-            let on = row[gx / 8] & (0x80 >> (gx % 8)) != 0;
-            let ink = on || (bold && prev_on);
-            put_px(fb, x + gx, py, if ink { fg } else { bg });
-            prev_on = on;
+        let mut prev = 0;
+        for (gx, &coverage) in row.iter().enumerate() {
+            let ink = if bold { coverage.max(prev) } else { coverage };
+            put_px(fb, x + gx, py, blend(fg, bg, ink));
+            prev = coverage;
+        }
+    }
+}
+
+/// Mix two RGB565 colours: `ink` 0 gives `bg`, 255 gives `fg`.
+#[inline]
+fn blend(fg: u16, bg: u16, ink: u8) -> u16 {
+    match ink {
+        0 => bg,
+        255 => fg,
+        _ => {
+            let a = ink as u32;
+            let mix = |shift: u32, mask: u32| {
+                let f = (fg as u32 >> shift) & mask;
+                let b = (bg as u32 >> shift) & mask;
+                (((f * a + b * (255 - a)) / 255) << shift) as u16
+            };
+            mix(11, 0x1F) | mix(5, 0x3F) | mix(0, 0x1F)
         }
     }
 }
 
 /// Draw a text label (no wrapping) — used by the on-screen keyboard.
-pub fn draw_text(fb: &mut [u8], font: &Psf2Font, x: usize, y: usize, s: &str, fg: u16, bg: u16) {
+pub fn draw_text(fb: &mut [u8], font: &Font, x: usize, y: usize, s: &str, fg: u16, bg: u16) {
     let mut cx = x;
     for c in s.chars() {
         if cx + font.width > SCREEN_W {
@@ -106,7 +122,7 @@ impl TermArea {
 /// Render one damaged viewport line from the grid into the framebuffer.
 pub fn draw_line<T: EventListener>(
     fb: &mut [u8],
-    font: &Psf2Font,
+    font: &Font,
     palette: &Palette,
     term: &Term<T>,
     area: &TermArea,
