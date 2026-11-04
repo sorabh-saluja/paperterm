@@ -15,6 +15,8 @@ pub const MESSAGE_TERMINATE: u8 = 3;
 pub const MESSAGE_USERINPUT: u8 = 4;
 pub const MESSAGE_SET_REFRESH_MODE: u8 = 5;
 pub const MESSAGE_REQUEST_FULL_REFRESH: u8 = 6;
+pub const MESSAGE_DEVICE_STATE_CHANGED: u8 = 7;
+pub const MESSAGE_DEVICE_STATE_INIT: u8 = 8;
 
 pub const UPDATE_ALL: i32 = 0;
 pub const UPDATE_PARTIAL: i32 = 1;
@@ -62,6 +64,8 @@ pub struct QtfbClient {
     pub height: usize,
     /// bytes per pixel
     pub bpp: usize,
+    /// The latest orientation from AppLoad, until it is collected.
+    rotation: std::cell::Cell<Option<i32>>,
 }
 
 // The raw pointer is to a MAP_SHARED region; we are the only writer thread.
@@ -102,14 +106,22 @@ impl QtfbClient {
 
         // Init reply: shmKey i32 @8, shmSize u64 @16. Server closing without
         // replying (recv == 0) means init was rejected.
+        // Rotation messages can arrive ahead of it.
+        let rotation = std::cell::Cell::new(None);
         let mut reply = [0u8; 32];
-        let n = unsafe { libc::recv(fd, reply.as_mut_ptr() as *mut libc::c_void, 32, 0) };
-        if n <= 0 {
-            unsafe { libc::close(fd) };
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "qtfb server rejected init (no reply)",
-            ));
+        loop {
+            let n = unsafe { libc::recv(fd, reply.as_mut_ptr() as *mut libc::c_void, 32, 0) };
+            if n <= 0 {
+                unsafe { libc::close(fd) };
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "qtfb server rejected init (no reply)",
+                ));
+            }
+            if reply[0] == MESSAGE_INITIALIZE {
+                break;
+            }
+            note_rotation(&reply, &rotation);
         }
         let shm_key = i32::from_le_bytes(reply[8..12].try_into().unwrap());
         let shm_size = u64::from_le_bytes(reply[16..24].try_into().unwrap()) as usize;
@@ -159,6 +171,7 @@ impl QtfbClient {
             width,
             height,
             bpp,
+            rotation,
         })
     }
 
@@ -213,6 +226,27 @@ impl QtfbClient {
         let _ = self.send_msg(&msg);
     }
 
+    /// The orientation AppLoad last reported, once.
+    pub fn take_rotation(&self) -> Option<i32> {
+        self.rotation.take()
+    }
+
+    /// Wait briefly for AppLoad's first orientation message, so the shell starts
+    /// at the right size. AppLoad sends it once the window is attached.
+    pub fn wait_for_rotation(&self, timeout_ms: i32) -> Option<i32> {
+        let mut waited = 0;
+        while waited < timeout_ms {
+            let _ = self.drain_events();
+            if let Some(rotation) = self.take_rotation() {
+                return Some(rotation);
+            }
+            let mut poll_fd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            unsafe { libc::poll(&mut poll_fd, 1, 50) };
+            waited += 50;
+        }
+        None
+    }
+
     /// Drain pending server messages. Returns input events, or Err on
     /// disconnect (window closed -> we must exit).
     pub fn drain_events(&self) -> io::Result<Vec<InputEvent>> {
@@ -245,6 +279,7 @@ impl QtfbClient {
                     d: i32::from_le_bytes(buf[24..28].try_into().unwrap()),
                 });
             }
+            note_rotation(&buf, &self.rotation);
         }
     }
 }
@@ -256,6 +291,14 @@ impl Drop for QtfbClient {
             libc::munmap(self.shm as *mut libc::c_void, self.shm_len);
             libc::close(self.fd);
         }
+    }
+}
+
+/// DeviceStateChangedContents: reason i32 @8 (0 = rotation), rotation i32 @12.
+fn note_rotation(msg: &[u8; 32], rotation: &std::cell::Cell<Option<i32>>) {
+    let is_state = msg[0] == MESSAGE_DEVICE_STATE_CHANGED || msg[0] == MESSAGE_DEVICE_STATE_INIT;
+    if is_state && i32::from_le_bytes(msg[8..12].try_into().unwrap()) == 0 {
+        rotation.set(Some(i32::from_le_bytes(msg[12..16].try_into().unwrap())));
     }
 }
 

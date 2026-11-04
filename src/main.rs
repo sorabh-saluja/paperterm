@@ -8,6 +8,7 @@ mod osk;
 mod palette;
 mod qtfb;
 mod render;
+mod screen;
 mod settings;
 mod ui;
 
@@ -27,9 +28,9 @@ use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Op
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use polling::{Event as PollEvent, Events, PollMode, Poller};
 
-use crate::render::{TermArea, SCREEN_W};
+use crate::render::TermArea;
+use crate::screen::{Canvas, Rotation, PANEL_H, PANEL_W};
 
-const SCREEN_H: usize = 2160;
 const OSK_H: usize = 460;
 
 /// The on-screen keyboard keeps its own font, so its labels always fit the keys.
@@ -90,22 +91,23 @@ impl DirtyRegion {
     }
 
     /// Returns whether anything was sent to the screen.
-    fn flush(&mut self, client: &qtfb::QtfbClient) -> bool {
-        let Some((x, y, w, h)) = self.rect.take() else {
+    fn flush(&mut self, client: &mut qtfb::QtfbClient, canvas: &Canvas, rotation: Rotation) -> bool {
+        let Some(rect) = self.rect.take() else {
             return false;
         };
+        let (x, y, w, h) = canvas.present(rotation, rect, client.framebuffer());
         let _ = client.update_partial(x as i32, y as i32, w as i32, h as i32);
         true
     }
 }
 
-fn term_area(font: &font::Font, term_h: usize) -> TermArea {
+fn term_area(font: &font::Font, screen_w: usize, term_h: usize) -> TermArea {
     TermArea {
-        cols: SCREEN_W / font.width,
+        cols: screen_w / font.width,
         rows: term_h / font.height,
         cw: font.width,
         ch: font.height,
-        x0: (SCREEN_W % font.width) / 2,
+        x0: (screen_w % font.width) / 2,
         y0: 0,
     }
 }
@@ -163,23 +165,29 @@ fn run() -> std::io::Result<()> {
         .map_err(std::io::Error::other)?;
     let osk_font = font::Font::load(0, OSK_FONT_SIZE, false).map_err(std::io::Error::other)?;
 
+    // ---- qtfb ----
+    let mut client =
+        qtfb::QtfbClient::connect(key, qtfb::FBFMT_RMPP_RGB565, PANEL_W, PANEL_H, 2)?;
+    let mut rotation = client
+        .wait_for_rotation(500)
+        .and_then(Rotation::from_wire)
+        .unwrap_or(Rotation::Deg0);
+    let mut canvas = Canvas::new(rotation);
+
     let mut osk_visible = !hw_keyboard::present();
 
     // Geometry: terminal on top, with the OSK band only when no hardware keyboard is present.
     let mut term_h = if osk_visible {
-        SCREEN_H - OSK_H
+        canvas.h - OSK_H
     } else {
-        SCREEN_H
+        canvas.h
     };
-    let mut area = term_area(&font, term_h);
+    let mut area = term_area(&font, canvas.w, term_h);
     eprintln!(
         "paperterm: starting, {}x{} cells, font {}x{}, key {}",
         area.cols, area.rows, font.width, font.height, key
     );
 
-    // ---- qtfb ----
-    let mut client =
-        qtfb::QtfbClient::connect(key, qtfb::FBFMT_RMPP_RGB565, SCREEN_W, SCREEN_H, 2)?;
     // NOTE: server stalls this connection 1s.
     let _ = client.set_refresh_mode(settings::REFRESH_OPTIONS[settings.refresh].mode);
 
@@ -238,26 +246,18 @@ fn run() -> std::io::Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigterm))?;
 
     let palette = palette::Palette::new();
-    let mut kbd = osk::Osk::new(term_h, OSK_H);
+    let mut kbd = osk::Osk::new(term_h, OSK_H, canvas.w);
     let mut physical = keys::PhysicalKeyboard::default();
     let mut ui = ui::Ui::new();
 
     // Initial paint: white screen, keyboard, full update.
-    render::fill_rect(
-        client.framebuffer(),
-        0,
-        0,
-        SCREEN_W,
-        SCREEN_H,
-        render::WHITE,
-    );
-    {
-        let fb = client.framebuffer();
-        if osk_visible {
-            kbd.draw_all(fb, &osk_font);
-        }
-        ui.draw_overlay(fb);
+    let (w, h) = (canvas.w, canvas.h);
+    render::fill_rect(&mut canvas, 0, 0, w, h, render::WHITE);
+    if osk_visible {
+        kbd.draw_all(&mut canvas, &osk_font);
     }
+    ui.draw_overlay(&mut canvas);
+    canvas.present(rotation, (0, 0, canvas.w, canvas.h), client.framebuffer());
     client.update_all()?;
 
     let mut events = Events::with_capacity(NonZeroUsize::new(32).unwrap());
@@ -286,13 +286,13 @@ fn run() -> std::io::Result<()> {
             if has_hwkbd == osk_visible {
                 osk_visible = !has_hwkbd;
                 if osk_visible {
-                    term_h = SCREEN_H - OSK_H;
-                    kbd = osk::Osk::new(term_h, OSK_H);
+                    term_h = canvas.h - OSK_H;
+                    kbd = osk::Osk::new(term_h, OSK_H, canvas.w);
                 } else {
-                    term_h = SCREEN_H;
-                    kbd.y0 = SCREEN_H;
+                    term_h = canvas.h;
+                    kbd.y0 = canvas.h;
                 }
-                area = term_area(&font, term_h);
+                area = term_area(&font, canvas.w, term_h);
                 resize_term(&mut term, &mut pty, &area);
                 repaint = true;
             }
@@ -322,10 +322,39 @@ fn run() -> std::io::Result<()> {
                         Ok(v) => v,
                         Err(_) => break 'main, // window closed
                     };
-                    for iev in input {
+                    let turned = client.take_rotation().and_then(Rotation::from_wire);
+                    if let Some(new) = turned.filter(|r| *r != rotation) {
+                        rotation = new;
+                        canvas = Canvas::new(rotation);
+                        term_h = if osk_visible { canvas.h - OSK_H } else { canvas.h };
+                        kbd = osk::Osk::new(term_h, OSK_H, canvas.w);
+                        if !osk_visible {
+                            kbd.y0 = canvas.h;
+                        }
+                        area = term_area(&font, canvas.w, term_h);
+                        resize_term(&mut term, &mut pty, &area);
+                        drag = None;
+                        repaint = true;
+                        full_refresh_due = true;
+                        if ui.settings_open() {
+                            ui.draw_panel(&mut canvas, term_h);
+                            dirty.add(0, 0, canvas.w, canvas.h);
+                        }
+                    }
+                    for mut iev in input {
+                        if matches!(
+                            iev.input_type,
+                            qtfb::INPUT_TOUCH_PRESS
+                                | qtfb::INPUT_TOUCH_UPDATE
+                                | qtfb::INPUT_TOUCH_RELEASE
+                                | qtfb::INPUT_PEN_PRESS
+                                | qtfb::INPUT_PEN_RELEASE
+                        ) {
+                            (iev.x, iev.y) = rotation.to_canvas(iev.x, iev.y);
+                        }
                         let command = match iev.input_type {
                             qtfb::INPUT_TOUCH_PRESS | qtfb::INPUT_PEN_PRESS => {
-                                ui.on_press(iev.x, iev.y, &settings)
+                                ui.on_press(iev.x, iev.y, &settings, (canvas.w, canvas.h))
                             }
                             // Typing doesn't reach the shell behind the settings screen.
                             qtfb::INPUT_BTN_PRESS if ui.settings_open() => {
@@ -342,6 +371,7 @@ fn run() -> std::io::Result<()> {
                                 iev,
                                 &mut kbd,
                                 &mut physical,
+                                &mut canvas,
                                 &mut client,
                                 &mut term,
                                 &mut pty,
@@ -353,14 +383,14 @@ fn run() -> std::io::Result<()> {
                             )?,
                             ui::UiCommand::Nothing => {}
                             ui::UiCommand::MenuOpened => {
-                                ui.draw_overlay(client.framebuffer());
-                                let (x, y, w, h) = ui.overlay_rect();
+                                ui.draw_overlay(&mut canvas);
+                                let (x, y, w, h) = ui.overlay_rect(canvas.w);
                                 dirty.add(x, y, w, h);
                             }
                             ui::UiCommand::Closed => repaint = true,
                             ui::UiCommand::PanelChanged => {
-                                ui.draw_panel(client.framebuffer(), term_h);
-                                dirty.add(0, 0, SCREEN_W, SCREEN_H);
+                                ui.draw_panel(&mut canvas, term_h);
+                                dirty.add(0, 0, canvas.w, canvas.h);
                             }
                             ui::UiCommand::RefreshScreen => {
                                 repaint = true;
@@ -375,7 +405,7 @@ fn run() -> std::io::Result<()> {
                                 {
                                     font = font::Font::load(new.font, new.size, new.crisp)
                                         .map_err(std::io::Error::other)?;
-                                    area = term_area(&font, term_h);
+                                    area = term_area(&font, canvas.w, term_h);
                                     resize_term(&mut term, &mut pty, &area);
                                 }
                                 if new.refresh != settings.refresh {
@@ -410,14 +440,14 @@ fn run() -> std::io::Result<()> {
 
         if repaint && !ui.settings_open() {
             repaint = false;
-            let fb = client.framebuffer();
-            render::fill_rect(fb, 0, 0, SCREEN_W, SCREEN_H, render::WHITE);
+            let (w, h) = (canvas.w, canvas.h);
+            render::fill_rect(&mut canvas, 0, 0, w, h, render::WHITE);
             if osk_visible {
-                kbd.draw_all(fb, &osk_font);
+                kbd.draw_all(&mut canvas, &osk_font);
             }
             redraw_all_lines = true;
             activity = true;
-            dirty.add(0, 0, SCREEN_W, SCREEN_H);
+            dirty.add(0, 0, w, h);
         }
 
         // Output arriving behind the settings screen is drawn when it closes.
@@ -431,13 +461,13 @@ fn run() -> std::io::Result<()> {
             term.reset_damage();
             redraw_all_lines = false;
 
-            let fb = client.framebuffer();
+            let fb = &mut canvas;
             match damage {
                 None => {
                     for row in 0..area.rows {
                         render::draw_line(fb, &font, &palette, &term, &area, row, 0, area.cols - 1);
                     }
-                    dirty.add(0, area.y0, SCREEN_W, area.rows * area.ch);
+                    dirty.add(0, area.y0, fb.w, area.rows * area.ch);
                 }
                 Some(lines) => {
                     for b in lines {
@@ -455,14 +485,14 @@ fn run() -> std::io::Result<()> {
         }
 
         if let Some(rect) = dirty.rect {
-            if !ui.settings_open() && ui.overlay_touches(rect) {
-                ui.draw_overlay(client.framebuffer());
-                let (x, y, w, h) = ui.overlay_rect();
+            if !ui.settings_open() && ui.overlay_touches(canvas.w, rect) {
+                ui.draw_overlay(&mut canvas);
+                let (x, y, w, h) = ui.overlay_rect(canvas.w);
                 dirty.add(x, y, w, h);
             }
         }
 
-        if dirty.flush(&client) && !ui.settings_open() {
+        if dirty.flush(&mut client, &canvas, rotation) && !ui.settings_open() {
             let cleanup = settings::CLEANUP_OPTIONS[settings.cleanup].1;
             updates_since_cleanup += 1;
             if cleanup > 0 && updates_since_cleanup >= cleanup {
@@ -486,6 +516,7 @@ fn handle_input(
     ev: qtfb::InputEvent,
     kbd: &mut osk::Osk,
     physical: &mut keys::PhysicalKeyboard,
+    canvas: &mut Canvas,
     client: &mut qtfb::QtfbClient,
     term: &mut Term<Listener>,
     pty: &mut tty::Pty,
@@ -521,10 +552,7 @@ fn handle_input(
         qtfb::INPUT_BTN_RELEASE => physical.release(ev.x),
         qtfb::INPUT_TOUCH_PRESS | qtfb::INPUT_PEN_PRESS => {
             if ev.y as usize >= kbd.y0 {
-                let osk_events = {
-                    let fb = client.framebuffer();
-                    kbd.press(ev.dev_id, ev.x, ev.y, fb, font)
-                };
+                let osk_events = kbd.press(ev.dev_id, ev.x, ev.y, canvas, font);
                 process_osk_events(osk_events, client, term, pty, dirty, activity)?;
             } else {
                 *drag = Some((ev.dev_id, ev.y));
@@ -548,10 +576,7 @@ fn handle_input(
             if drag.map(|(id, _)| id) == Some(ev.dev_id) {
                 *drag = None;
             }
-            let osk_events = {
-                let fb = client.framebuffer();
-                kbd.release(ev.dev_id, fb, font)
-            };
+            let osk_events = kbd.release(ev.dev_id, canvas, font);
             process_osk_events(osk_events, client, term, pty, dirty, activity)?;
         }
         _ => {}

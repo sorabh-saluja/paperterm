@@ -5,6 +5,7 @@
   "description": "A real terminal for your tablet, with an on-screen keyboard and fast partial e-ink updates.",
   "application": "paperterm",
   "qtfb": true,
+  "supportsRotation": true,
   "supportsVirtualKeyboard": true,
   "disablesWindowedMode": false,
   "environment": {

@@ -2,13 +2,12 @@
 
 use crate::font::Font;
 use crate::palette::Palette;
+use crate::screen::Canvas;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::Rgb;
-
-pub const SCREEN_W: usize = 1620;
 
 #[inline]
 pub fn rgb565(c: Rgb) -> u16 {
@@ -19,19 +18,19 @@ pub const WHITE: u16 = 0xFFFF;
 pub const BLACK: u16 = 0x0000;
 
 #[inline]
-fn put_px(fb: &mut [u8], x: usize, y: usize, c: u16) {
-    let i = (y * SCREEN_W + x) * 2;
-    fb[i] = (c & 0xff) as u8;
-    fb[i + 1] = (c >> 8) as u8;
+fn put_px(fb: &mut Canvas, x: usize, y: usize, c: u16) {
+    let i = (y * fb.w + x) * 2;
+    fb.px[i] = (c & 0xff) as u8;
+    fb.px[i + 1] = (c >> 8) as u8;
 }
 
-pub fn fill_rect(fb: &mut [u8], x: usize, y: usize, w: usize, h: usize, c: u16) {
+pub fn fill_rect(fb: &mut Canvas, x: usize, y: usize, w: usize, h: usize, c: u16) {
     let lo = (c & 0xff) as u8;
     let hi = (c >> 8) as u8;
-    for row in y..(y + h).min(2160) {
-        let start = (row * SCREEN_W + x) * 2;
-        let end = start + w.min(SCREEN_W - x) * 2;
-        let slice = &mut fb[start..end];
+    for row in y..(y + h).min(fb.h) {
+        let start = (row * fb.w + x) * 2;
+        let end = start + w.min(fb.w - x) * 2;
+        let slice = &mut fb.px[start..end];
         for px in slice.chunks_exact_mut(2) {
             px[0] = lo;
             px[1] = hi;
@@ -39,11 +38,11 @@ pub fn fill_rect(fb: &mut [u8], x: usize, y: usize, w: usize, h: usize, c: u16) 
     }
 }
 
-pub fn invert_rect(fb: &mut [u8], x: usize, y: usize, w: usize, h: usize) {
-    for row in y..(y + h).min(2160) {
-        let start = (row * SCREEN_W + x) * 2;
-        let end = start + w.min(SCREEN_W - x) * 2;
-        for b in &mut fb[start..end] {
+pub fn invert_rect(fb: &mut Canvas, x: usize, y: usize, w: usize, h: usize) {
+    for row in y..(y + h).min(fb.h) {
+        let start = (row * fb.w + x) * 2;
+        let end = start + w.min(fb.w - x) * 2;
+        for b in &mut fb.px[start..end] {
             *b = !*b;
         }
     }
@@ -51,7 +50,7 @@ pub fn invert_rect(fb: &mut [u8], x: usize, y: usize, w: usize, h: usize) {
 
 /// Draw one glyph cell. `bold` uses classic double-strike.
 pub fn draw_glyph(
-    fb: &mut [u8],
+    fb: &mut Canvas,
     font: &Font,
     x: usize,
     y: usize,
@@ -92,10 +91,10 @@ fn blend(fg: u16, bg: u16, ink: u8) -> u16 {
 }
 
 /// Draw a text label (no wrapping) — used by the on-screen keyboard.
-pub fn draw_text(fb: &mut [u8], font: &Font, x: usize, y: usize, s: &str, fg: u16, bg: u16) {
+pub fn draw_text(fb: &mut Canvas, font: &Font, x: usize, y: usize, s: &str, fg: u16, bg: u16) {
     let mut cx = x;
     for c in s.chars() {
-        if cx + font.width > SCREEN_W {
+        if cx + font.width > fb.w {
             break;
         }
         draw_glyph(fb, font, cx, y, c, fg, bg, false);
@@ -121,7 +120,7 @@ impl TermArea {
 
 /// Render one damaged viewport line from the grid into the framebuffer.
 pub fn draw_line<T: EventListener>(
-    fb: &mut [u8],
+    fb: &mut Canvas,
     font: &Font,
     palette: &Palette,
     term: &Term<T>,

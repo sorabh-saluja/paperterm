@@ -2,18 +2,18 @@
 //! is drawn into our own framebuffer, so it also works in AppLoad's full screen.
 
 use crate::font::{Font, DEFAULT_SIZE, FONTS};
-use crate::render::{self, BLACK, SCREEN_W, WHITE};
+use crate::render::{self, BLACK, WHITE};
+use crate::screen::{Canvas, Rect};
+#[cfg(test)]
+use crate::screen::{Rotation, PANEL_H, PANEL_W};
 use crate::settings::{Settings, CLEANUP_OPTIONS, REFRESH_OPTIONS};
 
-pub type Rect = (usize, usize, usize, usize);
-
-const SCREEN_H: usize = 2160;
 const MARGIN: usize = 48;
 const GAP: usize = 20;
-const CONTENT_W: usize = SCREEN_W - 2 * MARGIN;
+/// Width of the controls on a sideways screen; the preview takes the rest.
+const LANDSCAPE_CONTROLS_W: usize = 1180;
 const BUTTON_H: usize = 100;
 
-const PILL: Rect = (SCREEN_W - 196, 12, 180, 76);
 const MENU_W: usize = 500;
 const MENU_ROW_H: usize = 112;
 const MENU_ITEMS: [(&str, MenuItem); 3] = [
@@ -21,12 +21,15 @@ const MENU_ITEMS: [(&str, MenuItem); 3] = [
     ("Refresh screen", MenuItem::Refresh),
     ("Exit PaperTerm", MenuItem::Exit),
 ];
-const MENU: Rect = (
-    SCREEN_W - 16 - MENU_W,
-    PILL.1 + PILL.3 + 8,
-    MENU_W,
-    MENU_ROW_H * MENU_ITEMS.len(),
-);
+
+fn pill(w: usize) -> Rect {
+    (w - 196, 12, 180, 76)
+}
+
+fn menu(w: usize) -> Rect {
+    let p = pill(w);
+    (w - 16 - MENU_W, p.1 + p.3 + 8, MENU_W, MENU_ROW_H * MENU_ITEMS.len())
+}
 
 const PREVIEW_LINES: [&str; 7] = [
     "The quick brown fox jumps over the lazy dog",
@@ -103,7 +106,7 @@ fn intersects(a: Rect, b: Rect) -> bool {
     a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
 }
 
-fn draw_button(fb: &mut [u8], font: &Font, rect: Rect, label: &str, selected: bool) {
+fn draw_button(fb: &mut Canvas, font: &Font, rect: Rect, label: &str, selected: bool) {
     let (x, y, w, h) = rect;
     let (fg, bg) = if selected { (WHITE, BLACK) } else { (BLACK, WHITE) };
     render::fill_rect(fb, x, y, w, h, bg);
@@ -118,9 +121,13 @@ fn draw_button(fb: &mut [u8], font: &Font, rect: Rect, label: &str, selected: bo
     render::draw_text(fb, font, tx, ty, label, fg, bg);
 }
 
-/// `count` equal buttons side by side across the content width.
-fn row(y: usize, count: usize, i: usize) -> Rect {
-    let w = (CONTENT_W - GAP * (count - 1)) / count;
+fn controls_w(w: usize, h: usize) -> usize {
+    if w > h { LANDSCAPE_CONTROLS_W } else { w - 2 * MARGIN }
+}
+
+/// `count` equal buttons side by side across the controls' width.
+fn row(content_w: usize, y: usize, count: usize, i: usize) -> Rect {
+    let w = (content_w - GAP * (count - 1)) / count;
     (MARGIN + i * (w + GAP), y, w, BUTTON_H)
 }
 
@@ -138,39 +145,45 @@ const HINT_Y: usize = REFRESH_Y + BUTTON_H + 12;
 const CLEANUP_LABEL_Y: usize = HINT_Y + 60;
 const CLEANUP_Y: usize = CLEANUP_LABEL_Y + 52;
 const PREVIEW_LABEL_Y: usize = CLEANUP_Y + BUTTON_H + 24;
-const PREVIEW: Rect = (
-    MARGIN,
-    PREVIEW_LABEL_Y + 52,
-    CONTENT_W,
-    SCREEN_H - 36 - (PREVIEW_LABEL_Y + 52),
-);
 const FONT_COLUMNS: usize = 3;
 
-fn font_rect(i: usize) -> Rect {
-    let (x, _, w, h) = row(0, FONT_COLUMNS, i % FONT_COLUMNS);
+fn font_rect(content_w: usize, i: usize) -> Rect {
+    let (x, _, w, h) = row(content_w, 0, FONT_COLUMNS, i % FONT_COLUMNS);
     (x, FONT_Y + (i / FONT_COLUMNS) * (h + GAP), w, h)
 }
 
-fn panel_buttons() -> Vec<(Rect, Hit)> {
+/// Where the "Preview" heading sits, and the box under it.
+fn preview_area(w: usize, h: usize) -> (usize, usize, Rect) {
+    if w > h {
+        let x = MARGIN + LANDSCAPE_CONTROLS_W + GAP * 2;
+        (x, FONT_LABEL_Y, (x, FONT_Y, w - MARGIN - x, h - 36 - FONT_Y))
+    } else {
+        let y = PREVIEW_LABEL_Y + 52;
+        (MARGIN, PREVIEW_LABEL_Y, (MARGIN, y, w - 2 * MARGIN, h - 36 - y))
+    }
+}
+
+fn panel_buttons(w: usize, h: usize) -> Vec<(Rect, Hit)> {
+    let content = controls_w(w, h);
     let mut out = vec![
-        ((SCREEN_W - MARGIN - 440 - GAP, HEADER_Y, 220, 92), Hit::Cancel),
-        ((SCREEN_W - MARGIN - 220, HEADER_Y, 220, 92), Hit::Done),
+        ((w - MARGIN - 440 - GAP, HEADER_Y, 220, 92), Hit::Cancel),
+        ((w - MARGIN - 220, HEADER_Y, 220, 92), Hit::Done),
         ((MARGIN, SIZE_Y, 140, BUTTON_H), Hit::Smaller),
         ((MARGIN + 340, SIZE_Y, 140, BUTTON_H), Hit::Bigger),
-        (row(TEXT_Y, 2, 0), Hit::Text(false)),
-        (row(TEXT_Y, 2, 1), Hit::Text(true)),
+        (row(content, TEXT_Y, 2, 0), Hit::Text(false)),
+        (row(content, TEXT_Y, 2, 1), Hit::Text(true)),
     ];
     for i in 0..FONTS.len() {
-        out.push((font_rect(i), Hit::Font(i)));
+        out.push((font_rect(content, i), Hit::Font(i)));
     }
     for i in 0..REFRESH_OPTIONS.len() {
-        out.push((row(REFRESH_Y, REFRESH_OPTIONS.len(), i), Hit::Refresh(i)));
+        out.push((row(content, REFRESH_Y, REFRESH_OPTIONS.len(), i), Hit::Refresh(i)));
     }
     let cleanup_columns = CLEANUP_OPTIONS.len() + 1;
     for i in 0..CLEANUP_OPTIONS.len() {
-        out.push((row(CLEANUP_Y, cleanup_columns, i), Hit::Cleanup(i)));
+        out.push((row(content, CLEANUP_Y, cleanup_columns, i), Hit::Cleanup(i)));
     }
-    out.push((row(CLEANUP_Y, cleanup_columns, cleanup_columns - 1), Hit::CleanNow));
+    out.push((row(content, CLEANUP_Y, cleanup_columns, cleanup_columns - 1), Hit::CleanNow));
     out
 }
 
@@ -221,10 +234,13 @@ impl Ui {
         UiCommand::RefreshScreen
     }
 
-    pub fn on_press(&mut self, x: i32, y: i32, settings: &Settings) -> UiCommand {
+    /// `screen` is the canvas's width and height.
+    pub fn on_press(&mut self, x: i32, y: i32, settings: &Settings, screen: (usize, usize)) -> UiCommand {
+        let (w, h) = screen;
+        let menu_box = menu(w);
         match &mut self.screen {
             Screen::Terminal => {
-                if contains(PILL, x, y) {
+                if contains(pill(w), x, y) {
                     self.screen = Screen::Menu;
                     UiCommand::MenuOpened
                 } else {
@@ -234,7 +250,7 @@ impl Ui {
             Screen::Menu => {
                 self.screen = Screen::Terminal;
                 let item = MENU_ITEMS.iter().enumerate().find_map(|(i, (_, item))| {
-                    let rect = (MENU.0, MENU.1 + i * MENU_ROW_H, MENU_W, MENU_ROW_H);
+                    let rect = (menu_box.0, menu_box.1 + i * MENU_ROW_H, MENU_W, MENU_ROW_H);
                     contains(rect, x, y).then_some(*item)
                 });
                 match item {
@@ -248,7 +264,7 @@ impl Ui {
                 }
             }
             Screen::Settings(panel) => {
-                let Some((_, hit)) = panel_buttons().into_iter().find(|(r, _)| contains(*r, x, y)) else {
+                let Some((_, hit)) = panel_buttons(w, h).into_iter().find(|(r, _)| contains(*r, x, y)) else {
                     return UiCommand::Nothing;
                 };
                 match hit {
@@ -283,34 +299,41 @@ impl Ui {
     }
 
     /// The part of the screen the floating controls cover.
-    pub fn overlay_rect(&self) -> Rect {
+    pub fn overlay_rect(&self, w: usize) -> Rect {
+        let p = pill(w);
         match self.screen {
-            Screen::Menu => (MENU.0, PILL.1, MENU.2, MENU.1 + MENU.3 - PILL.1),
-            _ => PILL,
+            Screen::Menu => {
+                let m = menu(w);
+                (m.0, p.1, m.2, m.1 + m.3 - p.1)
+            }
+            _ => p,
         }
     }
 
-    pub fn overlay_touches(&self, dirty: Rect) -> bool {
-        intersects(self.overlay_rect(), dirty)
+    pub fn overlay_touches(&self, w: usize, dirty: Rect) -> bool {
+        intersects(self.overlay_rect(w), dirty)
     }
 
-    pub fn draw_overlay(&self, fb: &mut [u8]) {
-        draw_button(fb, &self.label, PILL, "Menu", matches!(self.screen, Screen::Menu));
-        if matches!(self.screen, Screen::Menu) {
+    pub fn draw_overlay(&self, fb: &mut Canvas) {
+        let open = matches!(self.screen, Screen::Menu);
+        draw_button(fb, &self.label, pill(fb.w), "Menu", open);
+        if open {
+            let m = menu(fb.w);
             for (i, (label, _)) in MENU_ITEMS.iter().enumerate() {
-                let rect = (MENU.0, MENU.1 + i * MENU_ROW_H, MENU_W, MENU_ROW_H);
+                let rect = (m.0, m.1 + i * MENU_ROW_H, MENU_W, MENU_ROW_H);
                 draw_button(fb, &self.label, rect, label, false);
             }
         }
     }
 
     /// Draw the settings screen. `term_h` is the height the terminal would have.
-    pub fn draw_panel(&self, fb: &mut [u8], term_h: usize) {
+    pub fn draw_panel(&self, fb: &mut Canvas, term_h: usize) {
         let Screen::Settings(panel) = &self.screen else { return };
         let s = &panel.draft;
-        render::fill_rect(fb, 0, 0, SCREEN_W, SCREEN_H, WHITE);
+        let (w, h) = (fb.w, fb.h);
+        render::fill_rect(fb, 0, 0, w, h, WHITE);
 
-        let heading = |fb: &mut [u8], y: usize, text: &str| {
+        let heading = |fb: &mut Canvas, y: usize, text: &str| {
             render::draw_text(fb, &self.label, MARGIN, y, text, BLACK, WHITE);
         };
         render::draw_text(fb, &self.title, MARGIN, HEADER_Y + 12, "Settings", BLACK, WHITE);
@@ -319,9 +342,10 @@ impl Ui {
         heading(fb, TEXT_LABEL_Y, "Text style");
         heading(fb, REFRESH_LABEL_Y, "Refresh mode");
         heading(fb, CLEANUP_LABEL_Y, "Automatic ghost cleanup");
-        heading(fb, PREVIEW_LABEL_Y, "Preview");
+        let (preview_x, preview_y, preview_box) = preview_area(w, h);
+        render::draw_text(fb, &self.label, preview_x, preview_y, "Preview", BLACK, WHITE);
 
-        for (rect, hit) in panel_buttons() {
+        for (rect, hit) in panel_buttons(w, h) {
             let (font, label, selected) = match hit {
                 Hit::Cancel => (&self.label, "Cancel", false),
                 Hit::Done => (&self.label, "Done", true),
@@ -342,19 +366,19 @@ impl Ui {
         render::draw_text(fb, &self.title, size_x, SIZE_Y + 18, &size, BLACK, WHITE);
         let grid = format!(
             "{} columns x {} rows",
-            SCREEN_W / panel.preview.width,
+            w / panel.preview.width,
             term_h / panel.preview.height
         );
         render::draw_text(fb, &self.label, MARGIN + 520, SIZE_Y + 30, &grid, BLACK, WHITE);
         render::draw_text(fb, &self.label, MARGIN, HINT_Y, REFRESH_OPTIONS[s.refresh].hint, BLACK, WHITE);
 
-        draw_preview(fb, &panel.preview);
+        draw_preview(fb, &panel.preview, preview_box);
     }
 }
 
-fn draw_preview(fb: &mut [u8], font: &Font) {
-    let (x, y, w, h) = PREVIEW;
-    draw_button(fb, font, PREVIEW, "", false);
+fn draw_preview(fb: &mut Canvas, font: &Font, area: Rect) {
+    let (x, y, w, h) = area;
+    draw_button(fb, font, area, "", false);
     let pad = 24;
     let cols = (w - 2 * pad) / font.width;
     let lines = (h - 2 * pad) / font.height;
@@ -368,35 +392,46 @@ fn draw_preview(fb: &mut [u8], font: &Font) {
 mod tests {
     use super::*;
 
+    const SCREENS: [(usize, usize); 2] = [(PANEL_W, PANEL_H), (PANEL_H, PANEL_W)];
+
     #[test]
     fn every_button_is_on_screen_and_none_overlap() {
-        let buttons = panel_buttons();
-        for (i, (a, hit)) in buttons.iter().enumerate() {
-            assert!(a.0 + a.2 <= SCREEN_W && a.1 + a.3 <= SCREEN_H, "{hit:?} off screen");
-            assert!(!intersects(*a, PREVIEW), "{hit:?} over preview");
-            for (b, other) in &buttons[i + 1..] {
-                assert!(!intersects(*a, *b), "{hit:?} overlaps {other:?}");
+        for (w, h) in SCREENS {
+            let buttons = panel_buttons(w, h);
+            let preview = preview_area(w, h).2;
+            assert!(preview.0 + preview.2 <= w && preview.1 + preview.3 <= h);
+            for (i, (a, hit)) in buttons.iter().enumerate() {
+                assert!(a.0 + a.2 <= w && a.1 + a.3 <= h, "{hit:?} off screen at {w}x{h}");
+                assert!(!intersects(*a, preview), "{hit:?} over preview at {w}x{h}");
+                for (b, other) in &buttons[i + 1..] {
+                    assert!(!intersects(*a, *b), "{hit:?} overlaps {other:?} at {w}x{h}");
+                }
             }
         }
     }
 
     #[test]
     fn menu_flow_opens_settings_and_cancel_returns() {
-        let settings = Settings::default();
-        let mut ui = Ui::new();
-        assert!(matches!(ui.on_press(10, 1000, &settings), UiCommand::Pass));
-        assert!(matches!(ui.on_press(PILL.0 as i32 + 1, PILL.1 as i32 + 1, &settings), UiCommand::MenuOpened));
-        assert!(matches!(
-            ui.on_press(MENU.0 as i32 + 1, MENU.1 as i32 + 1, &settings),
-            UiCommand::PanelChanged
-        ));
-        assert!(ui.settings_open());
-        let cancel = panel_buttons().into_iter().find(|(_, h)| *h == Hit::Cancel).unwrap().0;
-        assert!(matches!(
-            ui.on_press(cancel.0 as i32 + 1, cancel.1 as i32 + 1, &settings),
-            UiCommand::RefreshScreen
-        ));
-        assert!(!ui.settings_open());
+        for screen in SCREENS {
+            let (w, h) = screen;
+            let settings = Settings::default();
+            let mut ui = Ui::new();
+            assert!(matches!(ui.on_press(10, 1000, &settings, screen), UiCommand::Pass));
+            let p = pill(w);
+            assert!(matches!(ui.on_press(p.0 as i32 + 1, p.1 as i32 + 1, &settings, screen), UiCommand::MenuOpened));
+            let m = menu(w);
+            assert!(matches!(
+                ui.on_press(m.0 as i32 + 1, m.1 as i32 + 1, &settings, screen),
+                UiCommand::PanelChanged
+            ));
+            assert!(ui.settings_open());
+            let cancel = panel_buttons(w, h).into_iter().find(|(_, x)| *x == Hit::Cancel).unwrap().0;
+            assert!(matches!(
+                ui.on_press(cancel.0 as i32 + 1, cancel.1 as i32 + 1, &settings, screen),
+                UiCommand::RefreshScreen
+            ));
+            assert!(!ui.settings_open());
+        }
     }
 
     #[test]
@@ -411,35 +446,32 @@ mod tests {
         assert_eq!(panel.draft.size, FONTS[0].sizes()[0]);
     }
 
-    /// Writes raw RGB565 screens for checking the layout by eye:
-    /// PAPERTERM_DUMP_DIR=/tmp/out cargo test dump_screens
+    /// Writes raw RGB565 screens, as the panel receives them, for checking the
+    /// layout by eye: PAPERTERM_DUMP_DIR=/tmp/out cargo test dump_screens
     #[test]
     fn dump_screens() {
         let Ok(dir) = std::env::var("PAPERTERM_DUMP_DIR") else { return };
         let settings = Settings::default();
-        let mut fb = vec![0xFFu8; SCREEN_W * SCREEN_H * 2];
-        let mut ui = Ui::new();
+        for (name, rotation) in [("portrait", Rotation::Deg0), ("landscape", Rotation::Deg90L)] {
+            let mut fb = Canvas::new(rotation);
+            let screen = (fb.w, fb.h);
+            let mut ui = Ui::new();
+            let term = Font::load(settings.font, settings.size, false).unwrap();
+            for (i, line) in PREVIEW_LINES.iter().enumerate() {
+                render::draw_text(&mut fb, &term, 0, i * term.height, line, BLACK, WHITE);
+            }
+            ui.draw_overlay(&mut fb);
+            std::fs::write(format!("{dir}/{name}-terminal.raw"), &fb.px).unwrap();
 
-        let term = Font::load(settings.font, settings.size, false).unwrap();
-        for (i, line) in PREVIEW_LINES.iter().enumerate() {
-            render::draw_text(&mut fb, &term, 0, i * term.height, line, BLACK, WHITE);
+            let p = pill(fb.w);
+            ui.on_press(p.0 as i32 + 1, p.1 as i32 + 1, &settings, screen);
+            ui.draw_overlay(&mut fb);
+            std::fs::write(format!("{dir}/{name}-menu.raw"), &fb.px).unwrap();
+
+            let m = menu(fb.w);
+            ui.on_press(m.0 as i32 + 1, m.1 as i32 + 1, &settings, screen);
+            ui.draw_panel(&mut fb, screen.1);
+            std::fs::write(format!("{dir}/{name}-settings.raw"), &fb.px).unwrap();
         }
-        ui.draw_overlay(&mut fb);
-        std::fs::write(format!("{dir}/terminal.rgb565"), &fb).unwrap();
-
-        ui.on_press(PILL.0 as i32 + 1, PILL.1 as i32 + 1, &settings);
-        ui.draw_overlay(&mut fb);
-        std::fs::write(format!("{dir}/menu.rgb565"), &fb).unwrap();
-
-        ui.on_press(MENU.0 as i32 + 1, MENU.1 as i32 + 1, &settings);
-        ui.draw_panel(&mut fb, SCREEN_H);
-        std::fs::write(format!("{dir}/settings.rgb565"), &fb).unwrap();
-
-        let spleen = font_rect(4);
-        ui.on_press(spleen.0 as i32 + 1, spleen.1 as i32 + 1, &settings);
-        let crisp = row(TEXT_Y, 2, 1);
-        ui.on_press(crisp.0 as i32 + 1, crisp.1 as i32 + 1, &settings);
-        ui.draw_panel(&mut fb, SCREEN_H);
-        std::fs::write(format!("{dir}/settings-spleen.rgb565"), &fb).unwrap();
     }
 }

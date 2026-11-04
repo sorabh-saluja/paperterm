@@ -4,7 +4,8 @@
 
 use crate::font::Font;
 use crate::keys::KeyAction;
-use crate::render::{self, SCREEN_W};
+use crate::render;
+use crate::screen::Canvas;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub struct Osk {
     keys: Vec<Key>,
     pub y0: usize,
     pub height: usize,
+    width: usize,
     shift: ModState,
     ctrl: ModState,
     alt: ModState,
@@ -139,13 +141,13 @@ fn layout() -> Vec<Vec<(f32, KeyDef)>> {
 }
 
 impl Osk {
-    pub fn new(y0: usize, height: usize) -> Self {
+    pub fn new(y0: usize, height: usize, width: usize) -> Self {
         let rows = layout();
         let row_h = height / rows.len();
         let mut keys = Vec::new();
         for (ri, row) in rows.iter().enumerate() {
             let total: f32 = row.iter().map(|(u, _)| u).sum();
-            let unit = SCREEN_W as f32 / total;
+            let unit = width as f32 / total;
             let mut x = 0f32;
             for (u, def) in row {
                 let w = u * unit;
@@ -153,7 +155,7 @@ impl Osk {
                     def: *def,
                     x: x.round() as usize,
                     y: y0 + ri * row_h,
-                    w: (w.round() as usize).min(SCREEN_W - x.round() as usize),
+                    w: (w.round() as usize).min(width - x.round() as usize),
                     h: row_h,
                 });
                 x += w;
@@ -163,6 +165,7 @@ impl Osk {
             keys,
             y0,
             height,
+            width,
             shift: ModState::Off,
             ctrl: ModState::Off,
             alt: ModState::Off,
@@ -194,7 +197,7 @@ impl Osk {
     }
 
     /// Touch press at (x, y): returns events to act on.
-    pub fn press(&mut self, dev_id: i32, x: i32, y: i32, fb: &mut [u8], font: &Font) -> Vec<OskEvent> {
+    pub fn press(&mut self, dev_id: i32, x: i32, y: i32, fb: &mut Canvas, font: &Font) -> Vec<OskEvent> {
         let Some(idx) = self.hit(x, y) else { return vec![] };
         self.pressed.insert(dev_id, idx);
         let mut dirty = vec![];
@@ -211,7 +214,7 @@ impl Osk {
                 if m == Mod::Shift {
                     // Shift changes every key label: redraw the whole band.
                     self.draw_all(fb, font);
-                    dirty.push((0, self.y0, SCREEN_W, self.height));
+                    dirty.push((0, self.y0, self.width, self.height));
                 } else {
                     self.draw_key(fb, font, idx, true);
                     dirty.push(self.key_rect(idx));
@@ -245,13 +248,13 @@ impl Osk {
         out
     }
 
-    pub fn release(&mut self, dev_id: i32, fb: &mut [u8], font: &Font) -> Vec<OskEvent> {
+    pub fn release(&mut self, dev_id: i32, fb: &mut Canvas, font: &Font) -> Vec<OskEvent> {
         let Some(idx) = self.pressed.remove(&dev_id) else { return vec![] };
         self.draw_key(fb, font, idx, false);
         vec![OskEvent::Redraw(vec![self.key_rect(idx)])]
     }
 
-    fn consume_oneshots(&mut self, fb: &mut [u8], font: &Font) -> Vec<(usize, usize, usize, usize)> {
+    fn consume_oneshots(&mut self, fb: &mut Canvas, font: &Font) -> Vec<(usize, usize, usize, usize)> {
         let mut dirty = vec![];
         let mut shift_changed = false;
         for m in [Mod::Shift, Mod::Ctrl, Mod::Alt] {
@@ -275,7 +278,7 @@ impl Osk {
         if shift_changed {
             // Labels revert to unshifted: redraw the whole band.
             self.draw_all(fb, font);
-            dirty.push((0, self.y0, SCREEN_W, self.height));
+            dirty.push((0, self.y0, self.width, self.height));
         }
         dirty
     }
@@ -285,19 +288,19 @@ impl Osk {
         (k.x, k.y, k.w, k.h)
     }
 
-    pub fn draw_all(&self, fb: &mut [u8], font: &Font) {
-        render::fill_rect(fb, 0, self.y0, SCREEN_W, self.height, render::WHITE);
+    pub fn draw_all(&self, fb: &mut Canvas, font: &Font) {
+        render::fill_rect(fb, 0, self.y0, self.width, self.height, render::WHITE);
         for i in 0..self.keys.len() {
             let pressed = self.pressed.values().any(|&p| p == i);
             self.draw_key_i(fb, font, i, pressed);
         }
     }
 
-    fn draw_key(&self, fb: &mut [u8], font: &Font, idx: usize, pressed: bool) {
+    fn draw_key(&self, fb: &mut Canvas, font: &Font, idx: usize, pressed: bool) {
         self.draw_key_i(fb, font, idx, pressed);
     }
 
-    fn draw_key_i(&self, fb: &mut [u8], font: &Font, idx: usize, pressed: bool) {
+    fn draw_key_i(&self, fb: &mut Canvas, font: &Font, idx: usize, pressed: bool) {
         let k = &self.keys[idx];
         let (mut fg, mut bg) = (render::BLACK, render::WHITE);
         let latched = match k.def {
