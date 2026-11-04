@@ -238,6 +238,11 @@ impl Osk {
             KeyDef::Named(action, _) => {
                 let ctrl = self.ctrl != ModState::Off;
                 let alt = self.alt != ModState::Off;
+                let action = if action == KeyAction::Tab && self.shift != ModState::Off {
+                    KeyAction::BackTab
+                } else {
+                    action
+                };
                 out.push(OskEvent::Send(action, ctrl, alt));
                 self.draw_key(fb, font, idx, true);
                 dirty.push(self.key_rect(idx));

@@ -363,6 +363,10 @@ fn run() -> std::io::Result<()> {
                                     _ => ui::UiCommand::Nothing,
                                 }
                             }
+                            qtfb::INPUT_BTN_RELEASE if ui.settings_open() => {
+                                physical.release(iev.x);
+                                ui::UiCommand::Nothing
+                            }
                             qtfb::INPUT_VKB_PRESS if ui.settings_open() => ui::UiCommand::Nothing,
                             _ => ui::UiCommand::Pass,
                         };
@@ -539,8 +543,13 @@ fn handle_input(
             }
         }
         // Physical keyboards arrive as bare Qt::Key values, focused window only.
-        qtfb::INPUT_BTN_PRESS => {
-            if let Some((action, ctrl, alt)) = physical.press(ev.x) {
+        qtfb::INPUT_BTN_PRESS | qtfb::INPUT_BTN_RELEASE => {
+            let typed = if ev.input_type == qtfb::INPUT_BTN_PRESS {
+                physical.press(ev.x)
+            } else {
+                physical.release(ev.x)
+            };
+            if let Some((action, ctrl, alt)) = typed {
                 let bytes = keys::encode(action, ctrl, alt, *term.mode());
                 write_pty(pty, &bytes)?;
                 if term.grid().display_offset() != 0 {
@@ -549,7 +558,6 @@ fn handle_input(
                 }
             }
         }
-        qtfb::INPUT_BTN_RELEASE => physical.release(ev.x),
         qtfb::INPUT_TOUCH_PRESS | qtfb::INPUT_PEN_PRESS => {
             if ev.y as usize >= kbd.y0 {
                 let osk_events = kbd.press(ev.dev_id, ev.x, ev.y, canvas, font);

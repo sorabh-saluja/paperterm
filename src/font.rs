@@ -133,6 +133,10 @@ impl Font {
 
     fn rasterize(&self, c: char) -> Vec<u8> {
         let mut cell = vec![0u8; self.width * self.height];
+        // The terminal stores tabs in its cells, and they are blank on screen.
+        if c.is_control() {
+            return cell;
+        }
         match &self.raster {
             Raster::Bitmap(psf) => {
                 let bits = psf.glyph(c);
@@ -297,6 +301,14 @@ mod tests {
                 assert!(ink(&font, 'A') > 0, "{} {} has no ink", choice.name, size);
                 assert_eq!(ink(&font, ' '), 0, "{} {} space has ink", choice.name, size);
             }
+        }
+    }
+
+    #[test]
+    fn tabs_draw_as_blank_space() {
+        for i in 0..FONTS.len() {
+            let font = Font::load(i, FONTS[i].sizes()[0], false).unwrap();
+            assert_eq!(ink(&font, '\t'), 0, "{}", FONTS[i].name);
         }
     }
 
