@@ -183,6 +183,7 @@ fn run() -> std::io::Result<()> {
         .and_then(Rotation::from_wire)
         .unwrap_or(Rotation::Deg0);
     let mut canvas = Canvas::new(rotation);
+    canvas.dark = settings.dark;
 
     let mut osk_visible = !hw_keyboard::present();
 
@@ -242,7 +243,7 @@ fn run() -> std::io::Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigterm))?;
 
-    let palette = palette::Palette::new();
+    let mut palette = palette::Palette::new(settings.dark);
     let mut kbd = osk::Osk::new(term_h, OSK_H, canvas.w);
     let mut physical = keys::PhysicalKeyboard::default();
     let mut ui = ui::Ui::new();
@@ -408,6 +409,9 @@ fn run() -> std::io::Result<()> {
                                     let mode = settings::REFRESH_OPTIONS[new.refresh].mode;
                                     let _ = client.set_refresh_mode(mode);
                                 }
+                                if new.dark != settings.dark {
+                                    palette = palette::Palette::new(new.dark);
+                                }
                                 settings = new;
                                 if let Err(e) = settings.save() {
                                     eprintln!("paperterm: could not save settings: {e}");
@@ -490,6 +494,12 @@ fn run() -> std::io::Result<()> {
                 let (x, y, w, h) = ui.overlay_rect(canvas.w);
                 dirty.add(x, y, w, h);
             }
+        }
+
+        let dark = ui.dark(&settings);
+        if dark != canvas.dark {
+            canvas.dark = dark;
+            dirty.add(0, 0, canvas.w, canvas.h);
         }
 
         if dirty.flush(&mut client, &canvas, rotation) && !ui.settings_open() {

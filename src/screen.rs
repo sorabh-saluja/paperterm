@@ -63,11 +63,13 @@ impl Rotation {
 
 pub type Rect = (usize, usize, usize, usize);
 
-/// An upright RGB565 picture of the screen.
+/// An upright RGB565 picture of the screen. Everything draws as if the theme were
+/// light; in dark mode the picture is inverted on its way to the panel.
 pub struct Canvas {
     pub w: usize,
     pub h: usize,
     pub px: Vec<u8>,
+    pub dark: bool,
 }
 
 impl Canvas {
@@ -81,6 +83,7 @@ impl Canvas {
             w,
             h,
             px: vec![0xFF; w * h * 2],
+            dark: false,
         }
     }
 
@@ -88,17 +91,21 @@ impl Canvas {
     pub fn present(&self, rotation: Rotation, rect: Rect, panel: &mut [u8]) -> Rect {
         let (x, y) = (rect.0.min(self.w), rect.1.min(self.h));
         let (w, h) = (rect.2.min(self.w - x), rect.3.min(self.h - y));
+        let flip = if self.dark { 0xFF } else { 0 };
         for row in y..y + h {
             let line = &self.px[(row * self.w + x) * 2..(row * self.w + x + w) * 2];
             if rotation == Rotation::Deg0 {
-                panel[(row * PANEL_W + x) * 2..(row * PANEL_W + x + w) * 2].copy_from_slice(line);
+                let out = &mut panel[(row * PANEL_W + x) * 2..(row * PANEL_W + x + w) * 2];
+                for (to, from) in out.iter_mut().zip(line) {
+                    *to = from ^ flip;
+                }
                 continue;
             }
             for (i, px) in line.chunks_exact(2).enumerate() {
                 let (u, v) = rotation.to_panel(x + i, row);
                 let at = (v * PANEL_W + u) * 2;
-                panel[at] = px[0];
-                panel[at + 1] = px[1];
+                panel[at] = px[0] ^ flip;
+                panel[at + 1] = px[1] ^ flip;
             }
         }
         rotation.rect_to_panel((x, y, w, h))
@@ -108,6 +115,18 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dark_mode_inverts_what_reaches_the_panel() {
+        for rotation in [Rotation::Deg0, Rotation::Deg90L] {
+            let mut canvas = Canvas::new(rotation);
+            canvas.dark = true;
+            let mut panel = vec![0x55u8; PANEL_W * PANEL_H * 2];
+            canvas.present(rotation, (0, 0, canvas.w, canvas.h), &mut panel);
+            assert!(panel.iter().all(|b| *b == 0));
+            assert!(canvas.px.iter().all(|b| *b == 0xFF));
+        }
+    }
 
     const ALL: [Rotation; 4] = [Rotation::Deg0, Rotation::Deg90L, Rotation::Deg90R, Rotation::Deg180];
 

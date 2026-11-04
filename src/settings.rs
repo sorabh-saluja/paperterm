@@ -56,6 +56,7 @@ pub struct Settings {
     pub crisp: bool,
     pub refresh: usize,
     pub cleanup: usize,
+    pub dark: bool,
 }
 
 impl Default for Settings {
@@ -66,6 +67,7 @@ impl Default for Settings {
             crisp: false,
             refresh: DEFAULT_REFRESH,
             cleanup: 0,
+            dark: false,
         }
     }
 }
@@ -84,6 +86,7 @@ impl Settings {
                 }
                 "size" => s.size = value.parse().unwrap_or(s.size),
                 "text" => s.crisp = value == "crisp",
+                "theme" => s.dark = value == "dark",
                 "refresh" => {
                     if let Some(i) = REFRESH_OPTIONS.iter().position(|o| o.key == value) {
                         s.refresh = i;
@@ -104,12 +107,13 @@ impl Settings {
 
     pub fn to_text(&self) -> String {
         format!(
-            "font={}\nsize={}\ntext={}\nrefresh={}\ncleanup={}\n",
+            "font={}\nsize={}\ntext={}\nrefresh={}\ncleanup={}\ntheme={}\n",
             FONTS[self.font].name,
             self.size,
             if self.crisp { "crisp" } else { "smooth" },
             REFRESH_OPTIONS[self.refresh].key,
             CLEANUP_OPTIONS[self.cleanup].1,
+            if self.dark { "dark" } else { "light" },
         )
     }
 
@@ -147,6 +151,7 @@ mod tests {
             crisp: true,
             refresh: 3,
             cleanup: 2,
+            dark: true,
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
     }

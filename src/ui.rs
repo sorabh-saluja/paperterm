@@ -58,6 +58,7 @@ enum Hit {
     Smaller,
     Bigger,
     Text(bool),
+    Theme(bool),
     Refresh(usize),
     Cleanup(usize),
     CleanNow,
@@ -174,8 +175,10 @@ fn panel_buttons(w: usize, h: usize) -> Vec<(Rect, Hit)> {
         ((w - MARGIN - 220, HEADER_Y, 220, 92), Hit::Done),
         ((MARGIN, SIZE_Y, 140, BUTTON_H), Hit::Smaller),
         ((MARGIN + 340, SIZE_Y, 140, BUTTON_H), Hit::Bigger),
-        (row(content, TEXT_Y, 2, 0), Hit::Text(false)),
-        (row(content, TEXT_Y, 2, 1), Hit::Text(true)),
+        (row(content, TEXT_Y, 4, 0), Hit::Text(false)),
+        (row(content, TEXT_Y, 4, 1), Hit::Text(true)),
+        (row(content, TEXT_Y, 4, 2), Hit::Theme(false)),
+        (row(content, TEXT_Y, 4, 3), Hit::Theme(true)),
     ];
     for i in 0..FONTS.len() {
         out.push((font_rect(content, i), Hit::Font(i)));
@@ -225,6 +228,14 @@ impl Ui {
             samples: (0..FONTS.len())
                 .map(|i| Font::load(i, FONTS[i].nearest_size(40), false).expect("bundled fonts parse"))
                 .collect(),
+        }
+    }
+
+    /// The theme to show: the settings screen previews its choice before Done.
+    pub fn dark(&self, settings: &Settings) -> bool {
+        match &self.screen {
+            Screen::Settings(panel) => panel.draft.dark,
+            _ => settings.dark,
         }
     }
 
@@ -295,6 +306,7 @@ impl Ui {
                         panel.draft.crisp = crisp;
                         panel.reload_preview();
                     }
+                    Hit::Theme(dark) => panel.draft.dark = dark,
                     Hit::Refresh(i) => panel.draft.refresh = i,
                     Hit::Cleanup(i) => panel.draft.cleanup = i,
                 }
@@ -345,6 +357,8 @@ impl Ui {
         heading(fb, FONT_LABEL_Y, "Font");
         heading(fb, SIZE_LABEL_Y, "Size");
         heading(fb, TEXT_LABEL_Y, "Text style");
+        let theme_x = row(controls_w(w, h), TEXT_Y, 4, 2).0;
+        render::draw_text(fb, &self.label, theme_x, TEXT_LABEL_Y, "Theme", BLACK, WHITE);
         heading(fb, REFRESH_LABEL_Y, "Refresh mode");
         heading(fb, CLEANUP_LABEL_Y, "Automatic ghost cleanup");
         let (preview_x, preview_y, preview_box) = preview_area(w, h);
@@ -359,6 +373,8 @@ impl Ui {
                 Hit::Bigger => (&self.title, "+", false),
                 Hit::Text(false) => (&self.label, "Smooth", !s.crisp),
                 Hit::Text(true) => (&self.label, "Crisp", s.crisp),
+                Hit::Theme(false) => (&self.label, "Light", !s.dark),
+                Hit::Theme(true) => (&self.label, "Dark", s.dark),
                 Hit::Refresh(i) => (&self.label, REFRESH_OPTIONS[i].label, s.refresh == i),
                 Hit::Cleanup(i) => (&self.label, CLEANUP_OPTIONS[i].0, s.cleanup == i),
                 Hit::CleanNow => (&self.label, "Clean now", false),
@@ -437,6 +453,27 @@ mod tests {
             ));
             assert!(!ui.settings_open());
         }
+    }
+
+    #[test]
+    fn the_theme_previews_until_cancelled_and_sticks_when_done() {
+        let screen = (PANEL_H, PANEL_W);
+        let settings = Settings::default();
+        let tap = |ui: &mut Ui, hit: Hit| {
+            let rect = panel_buttons(screen.0, screen.1).into_iter().find(|(_, x)| *x == hit).unwrap().0;
+            ui.on_press(rect.0 as i32 + 1, rect.1 as i32 + 1, &settings, screen)
+        };
+
+        let mut ui = Ui::new();
+        ui.screen = Screen::Settings(Box::new(Panel::new(&settings)));
+        tap(&mut ui, Hit::Theme(true));
+        assert!(ui.dark(&settings));
+        tap(&mut ui, Hit::Cancel);
+        assert!(!ui.dark(&settings));
+
+        ui.screen = Screen::Settings(Box::new(Panel::new(&settings)));
+        tap(&mut ui, Hit::Theme(true));
+        assert!(matches!(tap(&mut ui, Hit::Done), UiCommand::Apply(new) if new.dark));
     }
 
     #[test]
