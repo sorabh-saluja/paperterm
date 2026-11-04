@@ -245,6 +245,11 @@ fn looks_like_typing_keyboard(block: &str, name: &str) -> bool {
         return false;
     }
 
+    // The reMarkable Type Folio's bitmap is too short for the check below.
+    if lower == "rm_keyboard" {
+        return true;
+    }
+
     // Real keyboards advertise a broad EV_KEY bitmap. The built-in power key is
     // also tagged as `kbd`, but its KEY bitmap is tiny.
     block
@@ -458,5 +463,24 @@ fn letter(c: char, shift: bool) -> char {
         c.to_ascii_uppercase()
     } else {
         c
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_the_type_folio_and_rejects_the_power_key() {
+        let folio = "N: Name=\"rM_Keyboard\"\nH: Handlers=kbd leds event4 \nB: KEY=40001e9000000000 77ffffffffffffe";
+        assert!(looks_like_typing_keyboard(folio, "rM_Keyboard"));
+        let power = "N: Name=\"30370000.snvs:snvs-powerkey\"\nH: Handlers=kbd event0 \nB: KEY=100000 0 0 0";
+        assert!(!looks_like_typing_keyboard(power, "30370000.snvs:snvs-powerkey"));
+    }
+
+    #[test]
+    fn maps_ctrl_c_keys() {
+        assert_eq!(map_key(46, false), Some(KeyAction::Char('c')));
+        assert_eq!(map_key(28, false), Some(KeyAction::Enter));
     }
 }
