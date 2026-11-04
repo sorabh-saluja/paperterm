@@ -16,10 +16,11 @@ const BUTTON_H: usize = 100;
 
 const MENU_W: usize = 500;
 const MENU_ROW_H: usize = 112;
-const MENU_ITEMS: [(&str, MenuItem); 3] = [
+const MENU_ITEMS: [(&str, MenuItem); 4] = [
     ("Settings", MenuItem::Settings),
     ("Refresh screen", MenuItem::Refresh),
     ("Exit PaperTerm", MenuItem::Exit),
+    ("End session", MenuItem::EndSession),
 ];
 
 fn pill(w: usize) -> Rect {
@@ -46,6 +47,7 @@ enum MenuItem {
     Settings,
     Refresh,
     Exit,
+    EndSession,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -76,6 +78,8 @@ pub enum UiCommand {
     CleanNow,
     Apply(Settings),
     Exit,
+    /// Close the shell too, instead of leaving it running for next time.
+    EndSession,
 }
 
 struct Panel {
@@ -260,6 +264,7 @@ impl Ui {
                     }
                     Some(MenuItem::Refresh) => UiCommand::RefreshScreen,
                     Some(MenuItem::Exit) => UiCommand::Exit,
+                    Some(MenuItem::EndSession) => UiCommand::EndSession,
                     None => UiCommand::Closed,
                 }
             }

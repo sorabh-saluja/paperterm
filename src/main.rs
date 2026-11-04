@@ -9,10 +9,11 @@ mod palette;
 mod qtfb;
 mod render;
 mod screen;
+mod session;
 mod settings;
 mod ui;
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::ErrorKind;
 use std::num::NonZeroUsize;
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
@@ -21,15 +22,15 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::{Config, LineDamageBounds, Term, TermDamage};
-use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use polling::{Event as PollEvent, Events, PollMode, Poller};
 
 use crate::render::TermArea;
 use crate::screen::{Canvas, Rotation, PANEL_H, PANEL_W};
+use crate::session::Session;
 
 const OSK_H: usize = 460;
 
@@ -112,18 +113,22 @@ fn term_area(font: &font::Font, screen_w: usize, term_h: usize) -> TermArea {
     }
 }
 
-/// Fit the terminal and the shell to `area`.
-fn resize_term(term: &mut Term<Listener>, pty: &mut tty::Pty, area: &TermArea) {
-    term.resize(GridSize {
-        cols: area.cols,
-        lines: area.rows,
-    });
-    pty.on_resize(WindowSize {
+fn window_size(area: &TermArea) -> WindowSize {
+    WindowSize {
         num_cols: area.cols as u16,
         num_lines: area.rows as u16,
         cell_width: area.cw as u16,
         cell_height: area.ch as u16,
+    }
+}
+
+/// Fit the terminal and the shell to `area`.
+fn resize_term(term: &mut Term<Listener>, session: &Session, area: &TermArea) {
+    term.resize(GridSize {
+        cols: area.cols,
+        lines: area.rows,
     });
+    let _ = session.resize(window_size(area));
     term.scroll_display(Scroll::Bottom);
 }
 
@@ -140,7 +145,12 @@ fn single_instance_lock() -> bool {
 }
 
 fn main() {
-    if let Err(e) = run() {
+    let args: Vec<String> = std::env::args().collect();
+    let result = match session::holder_size(&args) {
+        Some(size) => session::run_holder(size),
+        None => run(),
+    };
+    if let Err(e) = result {
         eprintln!("paperterm: fatal: {e}");
         std::process::exit(1);
     }
@@ -191,8 +201,7 @@ fn run() -> std::io::Result<()> {
     // NOTE: server stalls this connection 1s.
     let _ = client.set_refresh_mode(settings::REFRESH_OPTIONS[settings.refresh].mode);
 
-    // ---- terminal + pty ----
-    tty::setup_env();
+    // ---- terminal + shell session ----
     let size = GridSize {
         cols: area.cols,
         lines: area.rows,
@@ -208,32 +217,20 @@ fn run() -> std::io::Result<()> {
     );
     let mut parser: Processor<StdSyncHandler> = Processor::new();
 
-    let window_size = WindowSize {
-        num_cols: area.cols as u16,
-        num_lines: area.rows as u16,
-        cell_width: font.width as u16,
-        cell_height: font.height as u16,
-    };
-    let mut env = std::collections::HashMap::new();
-    env.insert("TERM".into(), "xterm-256color".into());
-    env.insert("HOME".into(), "/home/root".into());
-    env.insert(
-        "PATH".into(),
-        "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/root:/home/root/node/bin".into(),
-    );
-    let shell_path = std::env::var("PAPERTERM_SHELL").unwrap_or_else(|_| "/usr/bin/bash".into());
-    let pty_options = Options {
-        shell: Some(Shell::new(shell_path, vec!["-l".into()])),
-        working_directory: Some("/home/root".into()),
-        drain_on_exit: false,
-        env,
-    };
-    let mut pty = tty::new(&pty_options, window_size, 0)?;
+    let (session, replay) = Session::connect_or_start(window_size(&area))?;
+    parser.advance(&mut term, &replay);
+    // The shell already had the answers to any queries in the old output.
+    while event_rx.try_recv().is_ok() {}
+    let _ = session.resize(window_size(&area));
 
-    // ---- polling: key 0 = pty, key 1 = SIGCHLD pipe, key 2 = qtfb socket, 20+ = evdev keyboards ----
+    // ---- polling: key 0 = session, key 2 = qtfb socket ----
     let poller = Arc::new(Poller::new()?);
     unsafe {
-        pty.register(&poller, PollEvent::readable(0), PollMode::Level)?;
+        poller.add_with_mode(
+            &FdSource(session.raw_fd()),
+            PollEvent::readable(0),
+            PollMode::Level,
+        )?;
         poller.add_with_mode(
             &FdSource(client.raw_fd()),
             PollEvent::readable(2),
@@ -269,7 +266,7 @@ fn run() -> std::io::Result<()> {
     let mut next_hwkbd_scan = Instant::now() + Duration::from_secs(2);
     // Redraw everything once the settings screen is out of the way.
     let mut repaint = false;
-    let mut redraw_all_lines = false;
+    let mut redraw_all_lines = true;
     let mut full_refresh_due = false;
     let mut updates_since_cleanup = 0u32;
 
@@ -293,28 +290,23 @@ fn run() -> std::io::Result<()> {
                     kbd.y0 = canvas.h;
                 }
                 area = term_area(&font, canvas.w, term_h);
-                resize_term(&mut term, &mut pty, &area);
+                resize_term(&mut term, &session, &area);
                 repaint = true;
             }
         }
 
         for ev in events.iter() {
             match ev.key {
-                1 => {
-                    if let Some(ChildEvent::Exited(_)) = pty.next_child_event() {
-                        break 'main;
-                    }
-                }
                 0 if ev.readable => loop {
-                    match pty.reader().read(&mut buf) {
-                        Ok(0) => break,
+                    match session.read(&mut buf) {
+                        Ok(0) => break 'main, // the shell ended
                         Ok(n) => {
                             parser.advance(&mut term, &buf[..n]);
                             activity = true;
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(_) => break, // EIO: child gone; Exited event follows
+                        Err(_) => break 'main,
                     }
                 },
                 2 => {
@@ -332,7 +324,7 @@ fn run() -> std::io::Result<()> {
                             kbd.y0 = canvas.h;
                         }
                         area = term_area(&font, canvas.w, term_h);
-                        resize_term(&mut term, &mut pty, &area);
+                        resize_term(&mut term, &session, &area);
                         drag = None;
                         repaint = true;
                         full_refresh_due = true;
@@ -378,7 +370,7 @@ fn run() -> std::io::Result<()> {
                                 &mut canvas,
                                 &mut client,
                                 &mut term,
-                                &mut pty,
+                                &session,
                                 &osk_font,
                                 &area,
                                 &mut dirty,
@@ -410,7 +402,7 @@ fn run() -> std::io::Result<()> {
                                     font = font::Font::load(new.font, new.size, new.crisp)
                                         .map_err(std::io::Error::other)?;
                                     area = term_area(&font, canvas.w, term_h);
-                                    resize_term(&mut term, &mut pty, &area);
+                                    resize_term(&mut term, &session, &area);
                                 }
                                 if new.refresh != settings.refresh {
                                     let mode = settings::REFRESH_OPTIONS[new.refresh].mode;
@@ -425,6 +417,10 @@ fn run() -> std::io::Result<()> {
                                 full_refresh_due = true;
                             }
                             ui::UiCommand::Exit => break 'main,
+                            ui::UiCommand::EndSession => {
+                                let _ = session.end();
+                                break 'main;
+                            }
                         }
                     }
                 }
@@ -435,7 +431,7 @@ fn run() -> std::io::Result<()> {
         // Term-emitted events (query replies etc.).
         while let Ok(event) = event_rx.try_recv() {
             match event {
-                Event::PtyWrite(text) => write_pty(&mut pty, text.as_bytes())?,
+                Event::PtyWrite(text) => session.send_input(text.as_bytes())?,
                 Event::Exit | Event::ChildExit(_) => break 'main,
                 Event::Wakeup => activity = true,
                 _ => {}
@@ -523,7 +519,7 @@ fn handle_input(
     canvas: &mut Canvas,
     client: &mut qtfb::QtfbClient,
     term: &mut Term<Listener>,
-    pty: &mut tty::Pty,
+    session: &Session,
     font: &font::Font,
     area: &TermArea,
     dirty: &mut DirtyRegion,
@@ -535,7 +531,7 @@ fn handle_input(
         qtfb::INPUT_VKB_PRESS => {
             if let Some((action, ctrl, alt)) = keys::decode_vkb(ev.x) {
                 let bytes = keys::encode(action, ctrl, alt, *term.mode());
-                write_pty(pty, &bytes)?;
+                session.send_input(&bytes)?;
                 if term.grid().display_offset() != 0 {
                     term.scroll_display(Scroll::Bottom);
                     *activity = true;
@@ -551,7 +547,7 @@ fn handle_input(
             };
             if let Some((action, ctrl, alt)) = typed {
                 let bytes = keys::encode(action, ctrl, alt, *term.mode());
-                write_pty(pty, &bytes)?;
+                session.send_input(&bytes)?;
                 if term.grid().display_offset() != 0 {
                     term.scroll_display(Scroll::Bottom);
                     *activity = true;
@@ -561,7 +557,7 @@ fn handle_input(
         qtfb::INPUT_TOUCH_PRESS | qtfb::INPUT_PEN_PRESS => {
             if ev.y as usize >= kbd.y0 {
                 let osk_events = kbd.press(ev.dev_id, ev.x, ev.y, canvas, font);
-                process_osk_events(osk_events, client, term, pty, dirty, activity)?;
+                process_osk_events(osk_events, client, term, session, dirty, activity)?;
             } else {
                 *drag = Some((ev.dev_id, ev.y));
             }
@@ -585,7 +581,7 @@ fn handle_input(
                 *drag = None;
             }
             let osk_events = kbd.release(ev.dev_id, canvas, font);
-            process_osk_events(osk_events, client, term, pty, dirty, activity)?;
+            process_osk_events(osk_events, client, term, session, dirty, activity)?;
         }
         _ => {}
     }
@@ -596,7 +592,7 @@ fn process_osk_events(
     events: Vec<osk::OskEvent>,
     client: &mut qtfb::QtfbClient,
     term: &mut Term<Listener>,
-    pty: &mut tty::Pty,
+    session: &Session,
     dirty: &mut DirtyRegion,
     activity: &mut bool,
 ) -> std::io::Result<()> {
@@ -604,7 +600,7 @@ fn process_osk_events(
         match oev {
             osk::OskEvent::Send(action, ctrl, alt) => {
                 let bytes = keys::encode(action, ctrl, alt, *term.mode());
-                write_pty(pty, &bytes)?;
+                session.send_input(&bytes)?;
                 if term.grid().display_offset() != 0 {
                     term.scroll_display(Scroll::Bottom);
                     *activity = true;
@@ -618,21 +614,6 @@ fn process_osk_events(
                     dirty.add(x, y, w, h);
                 }
             }
-        }
-    }
-    Ok(())
-}
-
-fn write_pty(pty: &mut tty::Pty, bytes: &[u8]) -> std::io::Result<()> {
-    let mut written = 0;
-    while written < bytes.len() {
-        match pty.writer().write(&bytes[written..]) {
-            Ok(n) => written += n,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
         }
     }
     Ok(())
